@@ -130,8 +130,6 @@ class DeviceManager(QObject):
             "isDpiDisabled": dev.dpi.is_disabled if dev.dpi else False,
             "hasSidetone": Capability.SIDETONE in dev.capabilities,
             "sidetone": dev.sidetone if dev.sidetone is not None else 0,
-            "hasInactiveTime": Capability.INACTIVE_TIME in dev.capabilities,
-            "inactiveTime": dev.inactive_time if dev.inactive_time is not None else 15,
             "hasButtons": Capability.BUTTON_REMAP in dev.capabilities,
             "buttons": [
                 {"index": b.index, "name": b.name, "action": b.action_value}
@@ -178,22 +176,6 @@ class DeviceManager(QObject):
                 if isinstance(b, HeadsetBackend):
                     b.set_sidetone(device_id, level)
 
-        threading.Thread(target=_worker, daemon=True).start()
-
-    @Slot(str, int)
-    def setInactiveTime(self, device_id: str, minutes: int):
-        for d in self._cached_dict_devices:
-            if d["id"] == device_id:
-                d["inactiveTime"] = minutes
-                self.devicesChanged.emit()
-                break
-
-        def _worker():
-            for b in self.backends:
-                if isinstance(b, HeadsetBackend):
-                    b.set_inactive_time(device_id, minutes)
-
-        threading.Thread(target=_worker, daemon=True).start()
 
     @Slot(str, int, str, result=bool)
     def remapButton(self, device_id: str, button_idx: int, action: str) -> bool:

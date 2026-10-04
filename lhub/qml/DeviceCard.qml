@@ -9,7 +9,6 @@ Kirigami.Card {
     property var deviceData: ({})
     signal dpiSelected(int dpi)
     signal sidetoneChanged(int level)
-    signal inactiveTimeChanged(int minutes)
     signal buttonRemapRequested(int buttonIdx)
 
     header: RowLayout {
@@ -144,27 +143,6 @@ Kirigami.Card {
             }
         }
 
-        // Inactive Time Section (Headset)
-        ColumnLayout {
-            visible: Boolean(deviceData.hasInactiveTime)
-            Layout.fillWidth: true
-            spacing: Kirigami.Units.smallSpacing
-
-            QQC2.Label {
-                text: "Automatisch abschalten: " + (inactiveSlider.value === 0 ? "Nie" : (Math.round(inactiveSlider.value) + " Minuten"))
-                font.bold: true
-            }
-
-            QQC2.Slider {
-                id: inactiveSlider
-                Layout.fillWidth: true
-                from: 0
-                to: 60
-                stepSize: 5
-                value: deviceData.inactiveTime || 15
-                onMoved: root.inactiveTimeChanged(Math.round(value))
-            }
-        }
 
         // Buttons Section
         ColumnLayout {

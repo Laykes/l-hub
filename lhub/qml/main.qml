@@ -64,10 +64,6 @@ Kirigami.ApplicationWindow {
                         deviceManager.setSidetone(modelData.id, level)
                     }
 
-                    onInactiveTimeChanged: function(minutes) {
-                        deviceManager.setInactiveTime(modelData.id, minutes)
-                    }
-
                     onButtonRemapRequested: function(btnIdx) {
                         remapDialog.targetDeviceId = modelData.id
                         remapDialog.targetButtonIndex = btnIdx
