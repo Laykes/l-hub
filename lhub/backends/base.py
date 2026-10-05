@@ -28,6 +28,7 @@ class BatteryInfo:
     is_charging: bool = False
     is_supported: bool = True
     time_to_empty_min: Optional[int] = None
+    time_to_full_min: Optional[int] = None
     voltage_mv: Optional[int] = None
     status_text: str = ""
 
@@ -47,6 +48,12 @@ class ButtonMapping:
     name: str
     action_type: str = "button"
     action_value: str = ""
+    action_display: str = ""
+    label: str = ""
+    location: str = ""
+    group: str = "main"
+    default_action: str = ""
+
 
 
 @dataclass
@@ -92,3 +99,10 @@ class BaseBackend:
 
     def remap_button(self, device_id: str, button_idx: int, action: str) -> bool:
         return False
+
+    def batch_remap_buttons(self, device_id: str, buttons: Dict[int, str]) -> bool:
+        return False
+
+    def reset_defaults(self, device_id: str) -> bool:
+        return False
+

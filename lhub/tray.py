@@ -12,7 +12,7 @@ class LHubTray(QObject):
         self.tray = QSystemTrayIcon(self)
         icon = QIcon.fromTheme("input-gaming", QIcon.fromTheme("preferences-desktop-peripherals"))
         self.tray.setIcon(icon)
-        self.tray.setToolTip("L-Hub - Peripherie-Zentrale")
+        self.tray.setToolTip("L-Hub - Peripheral Control Center")
 
         self.menu = QMenu()
         self.tray.setContextMenu(self.menu)
@@ -29,28 +29,32 @@ class LHubTray(QObject):
 
         devs = self.manager.devices
         if not devs:
-            action = QAction("Keine Geräte verbunden", self.menu)
+            action = QAction("No devices connected", self.menu)
             action.setEnabled(False)
             self.menu.addAction(action)
         else:
             for d in devs:
                 text = d["name"]
                 if d.get("hasBattery"):
-                    lvl = d["batteryPercentage"]
-                    if lvl >= 0:
-                        charge = "⚡ " if d.get("isCharging") else "🔋 "
-                        text = f"{charge}{lvl}% - {d['name']}"
+                    lvl = d.get("batteryPercentage", -1)
+                    if d.get("isCharging"):
+                        if lvl >= 0:
+                            text = f"⚡ {lvl}% - {d['name']}"
+                        else:
+                            text = f"⚡ Charging - {d['name']}"
+                    elif lvl >= 0:
+                        text = f"🔋 {lvl}% - {d['name']}"
                 action = QAction(text, self.menu)
                 action.setEnabled(False)
                 self.menu.addAction(action)
 
         self.menu.addSeparator()
 
-        show_act = QAction("L-Hub öffnen", self.menu)
+        show_act = QAction("Open L-Hub", self.menu)
         show_act.triggered.connect(self._show_window)
         self.menu.addAction(show_act)
 
-        quit_act = QAction("Beenden", self.menu)
+        quit_act = QAction("Quit", self.menu)
         quit_act.triggered.connect(self._quit)
         self.menu.addAction(quit_act)
 
@@ -61,14 +65,21 @@ class LHubTray(QObject):
 
         tips = ["L-Hub"]
         for d in self.manager.devices:
-            if d.get("hasBattery") and d["batteryPercentage"] >= 0:
-                tips.append(f"{d['name']}: {d['batteryPercentage']}%")
+            if d.get("hasBattery"):
+                lvl = d.get("batteryPercentage", -1)
+                if d.get("isCharging"):
+                    if lvl >= 0:
+                        tips.append(f"{d['name']}: ⚡ {lvl}%")
+                    else:
+                        tips.append(f"{d['name']}: ⚡ Charging")
+                elif lvl >= 0:
+                    tips.append(f"{d['name']}: 🔋 {lvl}%")
         self.tray.setToolTip("\n".join(tips))
 
     def _on_battery_warning(self, name: str, percentage: int):
         self.tray.showMessage(
-            "Niedriger Akkustand",
-            f"{name} hat nur noch {percentage}% Akku!",
+            "Low Battery",
+            f"{name} battery is down to {percentage}%!",
             QSystemTrayIcon.Warning,
             6000,
         )

@@ -29,10 +29,11 @@ def run():
     engine.load(QUrl.fromLocalFile(str(qml_path)))
 
     if not engine.rootObjects():
-        print("Fehler: QML konnte nicht geladen werden.", file=sys.stderr)
+        print("Error: Could not load QML.", file=sys.stderr)
         sys.exit(1)
 
     window = engine.rootObjects()[0]
+    window.installEventFilter(manager)
     tray = LHubTray(manager, window)
 
     sys.exit(app.exec())

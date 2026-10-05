@@ -1,8 +1,38 @@
 import json
 import shutil
 import subprocess
-from typing import List, Dict, Optional
+import time
+from typing import List, Dict, Optional, Any
 from .base import BaseBackend, Device, DeviceType, Capability, BatteryInfo
+
+
+# Logitech charging curve for Li-Ion battery under ~500mA USB charge rate
+LOGITECH_CHARGING_CURVE = [
+    (4190, 100),
+    (4160, 90),
+    (4130, 75),
+    (4100, 60),
+    (4080, 50),
+    (4050, 35),
+    (4020, 20),
+    (3950, 10),
+    (3850, 5),
+    (3700, 0),
+]
+
+
+def _estimate_logitech_charging_percentage(voltage_mv: int) -> int:
+    if voltage_mv >= LOGITECH_CHARGING_CURVE[0][0]:
+        return 100
+    if voltage_mv <= LOGITECH_CHARGING_CURVE[-1][0]:
+        return 0
+    for i in range(len(LOGITECH_CHARGING_CURVE) - 1):
+        v_high, p_high = LOGITECH_CHARGING_CURVE[i]
+        v_low, p_low = LOGITECH_CHARGING_CURVE[i + 1]
+        if v_low <= voltage_mv <= v_high:
+            ratio = (voltage_mv - v_low) / (v_high - v_low)
+            return int(p_low + ratio * (p_high - p_low))
+    return 50
 
 
 class HeadsetBackend(BaseBackend):
@@ -13,13 +43,14 @@ class HeadsetBackend(BaseBackend):
         self._cmd = shutil.which("headsetcontrol")
         self._saved_sidetone: Dict[str, int] = {}
         self._saved_inactive: Dict[str, int] = {}
+        self._battery_tracker: Dict[str, Dict[str, Any]] = {}
 
     def is_available(self) -> bool:
         return self._cmd is not None
 
     def get_missing_reason(self) -> str:
         if not self.is_available():
-            return "HeadsetControl ist nicht installiert (sudo pacman -S headsetcontrol)"
+            return "HeadsetControl is not installed (sudo pacman -S headsetcontrol)"
         return ""
 
     def scan_devices(self) -> List[Device]:
@@ -70,18 +101,7 @@ class HeadsetBackend(BaseBackend):
                     caps.append(Capability.LIGHTING)
 
                 # Battery
-                bat_info = BatteryInfo()
-                bat_data = item.get("battery", {})
-                if isinstance(bat_data, dict):
-                    bat_info.percentage = bat_data.get("level", -1)
-                    bat_info.voltage_mv = bat_data.get("voltage_mv")
-                    bat_info.time_to_empty_min = bat_data.get("time_to_empty_min")
-                    status = bat_data.get("status", "")
-                    bat_info.status_text = status
-                    bat_info.is_charging = "charging" in status.lower() and "discharging" not in status.lower()
-                    bat_info.is_supported = status != "BATTERY_UNAVAILABLE"
-                elif isinstance(bat_data, (int, float)):
-                    bat_info.percentage = int(bat_data)
+                bat_info = self._process_battery_info(dev_id, vendor, item.get("battery", {}))
 
                 # Sidetone
                 sidetone_val = self._saved_sidetone.get(dev_id, 0)
@@ -119,7 +139,7 @@ class HeadsetBackend(BaseBackend):
             if "_" in device_id:
                 parts = device_id.split("_")
                 if len(parts) >= 3 and len(parts[1]) == 4 and len(parts[2]) == 4:
-                    cmd.extend(["-d", f"{parts[1]}:{parts[2]}"])
+                    cmd.extend(["-d", f"0x{parts[1]}:0x{parts[2]}"])
 
             res = subprocess.run(cmd, capture_output=True, timeout=3)
             if res.returncode == 0:
@@ -138,7 +158,7 @@ class HeadsetBackend(BaseBackend):
             if "_" in device_id:
                 parts = device_id.split("_")
                 if len(parts) >= 3 and len(parts[1]) == 4 and len(parts[2]) == 4:
-                    cmd.extend(["-d", f"{parts[1]}:{parts[2]}"])
+                    cmd.extend(["-d", f"0x{parts[1]}:0x{parts[2]}"])
 
             res = subprocess.run(cmd, capture_output=True, timeout=3)
             if res.returncode == 0:
@@ -147,3 +167,65 @@ class HeadsetBackend(BaseBackend):
         except Exception:
             pass
         return False
+
+    def _process_battery_info(self, dev_id: str, vendor: str, bat_data: Any) -> BatteryInfo:
+        bat_info = BatteryInfo()
+        if not bat_data:
+            return bat_info
+
+        if isinstance(bat_data, (int, float)):
+            bat_info.percentage = int(bat_data)
+            return bat_info
+
+        if not isinstance(bat_data, dict):
+            return bat_info
+
+        raw_level = bat_data.get("level", -1)
+        voltage_mv = bat_data.get("voltage_mv")
+        status = bat_data.get("status", "")
+        bat_info.voltage_mv = voltage_mv
+        bat_info.status_text = status
+        is_charging = ("charging" in status.lower() or "full" in status.lower()) and "discharging" not in status.lower()
+        bat_info.is_charging = is_charging
+        bat_info.is_supported = status != "BATTERY_UNAVAILABLE"
+
+        if not bat_info.is_supported or (raw_level < 0 and not is_charging):
+            bat_info.percentage = -1
+            return bat_info
+
+        now = time.time()
+        tracker = self._battery_tracker.setdefault(dev_id, {
+            "last_discharging_level": None,
+            "charging_start_time": None,
+            "charging_start_level": None,
+            "last_percentage": raw_level,
+        })
+
+        is_logitech = "logitech" in vendor.lower() or "046d" in dev_id.lower()
+
+        if not is_charging:
+            # Device running on battery (discharging)
+            tracker["charging_start_time"] = None
+            tracker["charging_start_level"] = None
+            if raw_level >= 0:
+                tracker["last_discharging_level"] = raw_level
+                tracker["last_percentage"] = raw_level
+                bat_info.percentage = raw_level
+            else:
+                bat_info.percentage = tracker.get("last_percentage", -1)
+
+            bat_info.time_to_empty_min = bat_data.get("time_to_empty_min")
+            if not bat_info.time_to_empty_min and bat_info.percentage > 0:
+                bat_info.time_to_empty_min = int(bat_info.percentage * 9)
+        else:
+            # Device is connected to charger (charging)
+            # Logitech headsets report inaccurate voltage/percentage under charge load.
+            # Avoid displaying misleading numbers; report -1 so UI displays "Charging" without false numbers.
+            if "full" in status.lower() or status == "BATTERY_FULL":
+                bat_info.percentage = 100
+                bat_info.time_to_full_min = 0
+            else:
+                bat_info.percentage = -1
+                bat_info.time_to_full_min = None
+
+        return bat_info
