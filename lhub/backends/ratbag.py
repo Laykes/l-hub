@@ -4,6 +4,7 @@ import subprocess
 import time
 from typing import List, Optional, Dict, Tuple
 from .base import BaseBackend, Device, DeviceType, Capability, DpiInfo, ButtonMapping
+from . import hidpp
 
 
 ACTION_DISPLAY_NAMES: Dict[str, str] = {
@@ -213,6 +214,7 @@ class RatbagBackend(BaseBackend):
         super().__init__("ratbagd")
         self._ctl = shutil.which("ratbagctl")
         self._resolution_maps: Dict[str, Dict[int, int]] = {}
+        self._usb_ids: Dict[str, Tuple[str, str]] = {}
 
     def is_available(self) -> bool:
         return self._ctl is not None
@@ -288,6 +290,8 @@ class RatbagBackend(BaseBackend):
                     if "(disabled)" not in line_s:
                         has_active_enabled_profile = True
             caps = [Capability.PROFILES]
+            if vid and pid:
+                self._usb_ids[dev_id] = (vid, pid)
             status_note = ""
             dpi_info = DpiInfo()
             buttons: List[ButtonMapping] = []
@@ -404,6 +408,13 @@ class RatbagBackend(BaseBackend):
             if current_from_lines:
                 info.current = current_from_lines
 
+        # ratbagd's value is stale when profile commits fail; the device itself is authoritative.
+        usb_id = self._usb_ids.get(dev_id)
+        if usb_id:
+            hw_dpi = hidpp.get_dpi(*usb_id)
+            if hw_dpi and 50 <= hw_dpi <= 30000:
+                info.current = hw_dpi
+
         default_presets = [400, 800, 1600, 3200]
         if len(valid_steps) >= 2:
             steps_set = set(valid_steps)
@@ -451,6 +462,9 @@ class RatbagBackend(BaseBackend):
         return buttons
 
     def set_dpi(self, device_id: str, dpi: int) -> bool:
+        usb_id = self._usb_ids.get(device_id)
+        if usb_id and hidpp.set_dpi(*usb_id, dpi):
+            return True
         if not self.is_available():
             return False
         try:
