@@ -20,8 +20,8 @@ dependencies = [
 l-hub = "lhub.main:run"
 
 [project.urls]
-Homepage = "https://github.com/lukas/l-hub"
-Repository = "https://github.com/lukas/l-hub"
+Homepage = "https://github.com/Laykes/l-hub"
+Repository = "https://github.com/Laykes/l-hub"
 
 [tool.setuptools.packages.find]
 where = ["."]

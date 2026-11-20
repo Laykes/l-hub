@@ -2,18 +2,18 @@ import math
 import time
 import threading
 from typing import List, Dict, Any, Optional, Set, Tuple
-from PySide6.QtCore import QObject, Signal, Slot, Property, QTimer, QCoreApplication, QEvent, Qt
+from PySide6.QtCore import QObject, Signal, Slot, Property, QTimer, QEvent, Qt
 from PySide6.QtGui import QKeyEvent, QKeySequence
 
 from .backends import (
     Device,
-    DeviceType,
     Capability,
     BaseBackend,
     RatbagBackend,
     HeadsetBackend,
     UPowerBackend,
 )
+from .backends import hidpp
 from .backends.ratbag import parse_button_action, KEY_DISPLAY_NAMES
 from .profiles import ProfileManager
 
@@ -24,8 +24,11 @@ class DeviceManager(QObject):
     devicesChanged = Signal()
     statusChanged = Signal()
     batteryWarning = Signal(str, int)  # device_name, percentage
+    onboardProfileChanged = Signal(str, str)  # device_name, profile_label
     testStateChanged = Signal()
     testResultChanged = Signal()
+    _hidppProfileEvent = Signal(str, int)  # device_key, profile_id
+    _hidppDpiEvent = Signal(str, int)  # device_key, dpi
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -39,6 +42,11 @@ class DeviceManager(QObject):
         self._cached_dict_devices: List[Dict[str, Any]] = []
         self._is_scanning = False
         self._warned_devices: Set[str] = set()
+        self._hidpp_monitors: Dict[str, hidpp.OnboardProfileMonitor] = {}
+        self._monitors_lock = threading.Lock()
+
+        self._hidppProfileEvent.connect(self._on_hidpp_profile_event)
+        self._hidppDpiEvent.connect(self._on_hidpp_dpi_event)
 
         # Button tester state
         self._is_testing_button = False
@@ -104,10 +112,102 @@ class DeviceManager(QObject):
             # Update cache and notify in main thread safe manner
             self._devices = merged
             self._cached_dict_devices = dict_devs
+            self._sync_hidpp_monitors(merged)
             self.devicesChanged.emit()
             self.statusChanged.emit()
         finally:
             self._is_scanning = False
+
+    def _sync_hidpp_monitors(self, devices: List[Device]):
+        active_keys: Set[str] = set()
+        with self._monitors_lock:
+            for d in devices:
+                if (
+                    d.usb_vid
+                    and d.usb_pid
+                    and d.usb_vid.lower() == hidpp.LOGITECH_VID
+                    and d.onboard_profile_id is not None
+                ):
+                    dev_key = self._get_device_key(d)
+                    active_keys.add(dev_key)
+                    existing = self._hidpp_monitors.get(dev_key)
+                    if existing is None or not existing.is_running:
+                        mon = hidpp.OnboardProfileMonitor(
+                            d.usb_vid,
+                            d.usb_pid,
+                            on_profile_changed=lambda pid, k=dev_key: self._hidppProfileEvent.emit(k, pid),
+                            on_dpi_changed=lambda dpi, k=dev_key: self._hidppDpiEvent.emit(k, dpi),
+                        )
+                        if mon.start():
+                            self._hidpp_monitors[dev_key] = mon
+
+            for stale_key in list(self._hidpp_monitors.keys()):
+                if stale_key not in active_keys:
+                    self._hidpp_monitors.pop(stale_key).stop()
+
+    def _on_hidpp_profile_event(self, device_key: str, profile_id: int):
+        label = hidpp.format_onboard_profile(profile_id)
+        target_dev: Optional[Device] = None
+        for d in self._devices:
+            if self._get_device_key(d) == device_key:
+                target_dev = d
+                break
+        if target_dev is None:
+            return
+
+        changed = target_dev.onboard_profile_id != profile_id
+        target_dev.onboard_profile_id = profile_id
+        target_dev.onboard_profile = label
+
+        for entry in self._cached_dict_devices:
+            if entry.get("deviceKey") == device_key:
+                entry["hasOnboardProfile"] = True
+                entry["onboardProfile"] = label
+                break
+
+        if changed:
+            self.devicesChanged.emit()
+            self.onboardProfileChanged.emit(target_dev.name, label)
+            if target_dev.usb_vid and target_dev.usb_pid:
+                vid, pid = target_dev.usb_vid, target_dev.usb_pid
+
+                def _read_new_dpi():
+                    dpi = hidpp.get_dpi(vid, pid)
+                    if dpi and 50 <= dpi <= 30000:
+                        self._hidppDpiEvent.emit(device_key, dpi)
+
+                threading.Thread(target=_read_new_dpi, daemon=True).start()
+
+    def _on_hidpp_dpi_event(self, device_key: str, dpi: int):
+        updated = False
+        for d in self._devices:
+            if self._get_device_key(d) == device_key and d.dpi:
+                if d.dpi.current != dpi:
+                    d.dpi.current = dpi
+                    if dpi not in d.dpi.steps:
+                        d.dpi.steps = sorted(set(d.dpi.steps + [dpi]))
+                    updated = True
+                break
+
+        if not updated:
+            return
+
+        for entry in self._cached_dict_devices:
+            if entry.get("deviceKey") == device_key:
+                entry["currentDpi"] = dpi
+                steps = entry.get("dpiSteps", [])
+                if dpi not in steps:
+                    entry["dpiSteps"] = sorted(set(steps + [dpi]))
+                break
+
+        self.devicesChanged.emit()
+
+    @Slot()
+    def cleanup(self):
+        with self._monitors_lock:
+            for mon in self._hidpp_monitors.values():
+                mon.stop()
+            self._hidpp_monitors.clear()
 
     def _merge_devices(self, raw_list: List[Device]) -> List[Device]:
         merged: List[Device] = []
@@ -164,6 +264,8 @@ class DeviceManager(QObject):
             "deviceKey": dev_key,
             "profiles": profiles,
             "activeProfile": active_profile,
+            "hasOnboardProfile": bool(dev.onboard_profile),
+            "onboardProfile": dev.onboard_profile or "",
             "capabilities": [c.value for c in dev.capabilities],
             "hasBattery": Capability.BATTERY in dev.capabilities and dev.battery is not None and dev.battery.is_supported,
             "batteryPercentage": dev.battery.percentage if dev.battery else -1,

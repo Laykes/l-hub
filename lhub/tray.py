@@ -20,6 +20,7 @@ class LHubTray(QObject):
         self.tray.activated.connect(self._on_tray_activated)
         self.manager.devicesChanged.connect(self._update_tray)
         self.manager.batteryWarning.connect(self._on_battery_warning)
+        self.manager.onboardProfileChanged.connect(self._on_onboard_profile_changed)
 
         self._build_menu()
         self.tray.show()
@@ -35,15 +36,17 @@ class LHubTray(QObject):
         else:
             for d in devs:
                 text = d["name"]
+                if d.get("hasOnboardProfile") and d.get("onboardProfile"):
+                    text = f"{text} ({d['onboardProfile']})"
                 if d.get("hasBattery"):
                     lvl = d.get("batteryPercentage", -1)
                     if d.get("isCharging"):
                         if lvl >= 0:
-                            text = f"⚡ {lvl}% - {d['name']}"
+                            text = f"⚡ {lvl}% - {text}"
                         else:
-                            text = f"⚡ Charging - {d['name']}"
+                            text = f"⚡ Charging - {text}"
                     elif lvl >= 0:
-                        text = f"🔋 {lvl}% - {d['name']}"
+                        text = f"🔋 {lvl}% - {text}"
                 action = QAction(text, self.menu)
                 action.setEnabled(False)
                 self.menu.addAction(action)
@@ -65,15 +68,17 @@ class LHubTray(QObject):
 
         tips = ["L-Hub"]
         for d in self.manager.devices:
+            parts = []
+            if d.get("hasOnboardProfile") and d.get("onboardProfile"):
+                parts.append(d["onboardProfile"])
             if d.get("hasBattery"):
                 lvl = d.get("batteryPercentage", -1)
                 if d.get("isCharging"):
-                    if lvl >= 0:
-                        tips.append(f"{d['name']}: ⚡ {lvl}%")
-                    else:
-                        tips.append(f"{d['name']}: ⚡ Charging")
+                    parts.append(f"⚡ {lvl}%" if lvl >= 0 else "⚡ Charging")
                 elif lvl >= 0:
-                    tips.append(f"{d['name']}: 🔋 {lvl}%")
+                    parts.append(f"🔋 {lvl}%")
+            if parts:
+                tips.append(f"{d['name']}: {' • '.join(parts)}")
         self.tray.setToolTip("\n".join(tips))
 
     def _on_battery_warning(self, name: str, percentage: int):
@@ -82,6 +87,14 @@ class LHubTray(QObject):
             f"{name} battery is down to {percentage}%!",
             QSystemTrayIcon.Warning,
             6000,
+        )
+
+    def _on_onboard_profile_changed(self, device_name: str, profile_label: str):
+        self.tray.showMessage(
+            device_name,
+            f"Onboard Profile: {profile_label}",
+            QSystemTrayIcon.Information,
+            2500,
         )
 
     def _on_tray_activated(self, reason):

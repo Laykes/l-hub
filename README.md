@@ -2,7 +2,7 @@
 
 A sleek, modular peripheral control center for Linux (KDE Plasma & Kirigami).
 
-L-Hub provides a unified, native interface to manage gaming mice, headsets, keyboards, and other peripherals on Linux with seamless KDE system tray integration.
+L-Hub provides a unified, native interface to configure gaming mice and headsets and monitor the battery of other wireless peripherals on Linux, with KDE system tray integration.
 
 > [!WARNING]
 > **Work in Progress (WIP)**  
@@ -34,15 +34,10 @@ L-Hub provides a unified, native interface to manage gaming mice, headsets, keyb
 
 ---
 
-## Status & Roadmap
+## Roadmap
 
-The following capabilities are planned or currently under development:
+Planned capabilities:
 
-- [x] Basic mouse DPI switching and button remapping
-- [x] Application-level profile manager
-- [x] Interactive button detection & tester
-- [x] Headset battery & sidetone control
-- [x] System tray & low battery notifications
 - [ ] **RGB / LED Lighting Control** (ratbag & OpenRGB integration)
 - [ ] **Advanced Macros & Key Sequences**
 - [ ] **Hardware-specific settings** (polling rate, debounce time, angle snapping, lift-off distance)
@@ -103,7 +98,7 @@ sudo systemctl enable --now ratbagd
 Clone the repository:
 
 ```bash
-git clone https://github.com/laykes/l-hub.git
+git clone https://github.com/Laykes/l-hub.git
 cd l-hub
 ```
 

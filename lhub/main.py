@@ -23,6 +23,7 @@ def run():
     engine = QQmlApplicationEngine()
 
     manager = DeviceManager()
+    app.aboutToQuit.connect(manager.cleanup)
     engine.rootContext().setContextProperty("deviceManager", manager)
 
     qml_path = Path(__file__).resolve().parent / "qml" / "main.qml"

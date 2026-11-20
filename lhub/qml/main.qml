@@ -12,6 +12,14 @@ Kirigami.ApplicationWindow {
     minimumWidth: 640
     minimumHeight: 480
 
+    Connections {
+        target: deviceManager
+
+        function onOnboardProfileChanged(deviceName, profileLabel) {
+            root.showPassiveNotification(deviceName + ": " + profileLabel)
+        }
+    }
+
     pageStack.initialPage: Kirigami.ScrollablePage {
         title: "My Devices"
 

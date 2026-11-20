@@ -51,6 +51,46 @@ Kirigami.Card {
             }
         }
 
+        // Live hardware onboard profile badge
+        Rectangle {
+            visible: Boolean(deviceData.hasOnboardProfile)
+            Layout.alignment: Qt.AlignRight | Qt.AlignVCenter
+            color: Qt.rgba(Kirigami.Theme.highlightColor.r, Kirigami.Theme.highlightColor.g, Kirigami.Theme.highlightColor.b, 0.16)
+            border.color: Kirigami.Theme.highlightColor
+            border.width: 1
+            radius: 6
+            implicitWidth: onboardRow.implicitWidth + 16
+            implicitHeight: onboardRow.implicitHeight + 8
+
+            RowLayout {
+                id: onboardRow
+                anchors.centerIn: parent
+                spacing: Kirigami.Units.smallSpacing
+
+                Kirigami.Icon {
+                    source: "media-flash"
+                    Layout.preferredWidth: Kirigami.Units.iconSizes.small
+                    Layout.preferredHeight: Kirigami.Units.iconSizes.small
+                }
+
+                QQC2.Label {
+                    text: "Onboard: " + (deviceData.onboardProfile || "")
+                    font.bold: true
+                    font.pointSize: Kirigami.Theme.smallFont.pointSize
+                }
+            }
+
+            QQC2.ToolTip.visible: onboardHover.containsMouse
+            QQC2.ToolTip.text: "Active hardware on-board profile (updates live)"
+
+            MouseArea {
+                id: onboardHover
+                anchors.fill: parent
+                hoverEnabled: true
+                acceptedButtons: Qt.NoButton
+            }
+        }
+
         // Battery indicator
         ColumnLayout {
             visible: Boolean(deviceData.hasBattery) && (deviceData.batteryPercentage >= 0 || deviceData.isCharging)
@@ -276,7 +316,7 @@ Kirigami.Card {
 
                 Rectangle {
                     color: Kirigami.Theme.alternateBackgroundColor
-                    border.color: Kirigami.Theme.separatorColor
+                    border.color: Kirigami.ColorUtils.linearInterpolation(Kirigami.Theme.backgroundColor, Kirigami.Theme.textColor, 0.2)
                     border.width: 1
                     radius: 4
                     implicitWidth: countLbl.implicitWidth + 10
@@ -474,7 +514,7 @@ Kirigami.Card {
 
                         border.color: isMatchingTest
                                       ? Kirigami.Theme.highlightColor
-                                      : (cardMouseArea.containsMouse ? Kirigami.Theme.focusColor : Kirigami.Theme.separatorColor)
+                                      : (cardMouseArea.containsMouse ? Kirigami.Theme.focusColor : Kirigami.ColorUtils.linearInterpolation(Kirigami.Theme.backgroundColor, Kirigami.Theme.textColor, 0.2))
                         border.width: isMatchingTest ? 2 : 1
 
                         RowLayout {

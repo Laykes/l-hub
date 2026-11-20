@@ -70,6 +70,8 @@ class Device:
     buttons: List[ButtonMapping] = field(default_factory=list)
     sidetone: Optional[int] = None  # 0-128
     inactive_time: Optional[int] = None  # minutes
+    onboard_profile_id: Optional[int] = None
+    onboard_profile: Optional[str] = None
     status_note: str = ""
     extra_props: Dict[str, Any] = field(default_factory=dict)
     backend_name: str = ""

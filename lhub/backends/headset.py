@@ -2,7 +2,7 @@ import json
 import shutil
 import subprocess
 import time
-from typing import List, Dict, Optional, Any
+from typing import List, Dict, Any
 from .base import BaseBackend, Device, DeviceType, Capability, BatteryInfo
 
 

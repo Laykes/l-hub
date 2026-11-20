@@ -154,7 +154,7 @@ Kirigami.Dialog {
             Layout.fillWidth: true
             color: Kirigami.Theme.alternateBackgroundColor
             radius: Kirigami.Units.smallSpacing
-            border.color: Kirigami.Theme.separatorColor
+            border.color: Kirigami.ColorUtils.linearInterpolation(Kirigami.Theme.backgroundColor, Kirigami.Theme.textColor, 0.2)
             border.width: 1
             implicitHeight: headerLayout.implicitHeight + Kirigami.Units.mediumSpacing * 2
 
@@ -506,7 +506,7 @@ Kirigami.Dialog {
                         color: root.isRecordingKey ? Kirigami.Theme.highlightColor : Kirigami.Theme.alternateBackgroundColor
                         opacity: root.isRecordingKey ? 0.25 : 1.0
                         radius: Kirigami.Units.smallSpacing
-                        border.color: root.isRecordingKey ? Kirigami.Theme.highlightColor : Kirigami.Theme.separatorColor
+                        border.color: root.isRecordingKey ? Kirigami.Theme.highlightColor : Kirigami.ColorUtils.linearInterpolation(Kirigami.Theme.backgroundColor, Kirigami.Theme.textColor, 0.2)
                         border.width: root.isRecordingKey ? 2 : 1
                         focus: true
 

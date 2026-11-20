@@ -344,6 +344,13 @@ class RatbagBackend(BaseBackend):
                     buttons = self._get_buttons(dev_id, num_buttons, dev_name, vid, pid)
 
 
+            onboard_profile_id = hidpp.get_onboard_profile(vid, pid) if (vid and pid) else None
+            onboard_profile = (
+                hidpp.format_onboard_profile(onboard_profile_id)
+                if onboard_profile_id is not None
+                else None
+            )
+
             return Device(
                 id=dev_id,
                 name=dev_name,
@@ -354,6 +361,8 @@ class RatbagBackend(BaseBackend):
                 capabilities=caps,
                 dpi=dpi_info,
                 buttons=buttons,
+                onboard_profile_id=onboard_profile_id,
+                onboard_profile=onboard_profile,
                 status_note=status_note,
                 backend_name=self.name,
             )
