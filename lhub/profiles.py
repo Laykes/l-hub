@@ -1,7 +1,10 @@
-import os
 import json
+import logging
+import os
 from pathlib import Path
 from typing import Dict, List, Optional, Any
+
+logger = logging.getLogger(__name__)
 
 
 DEFAULT_PROFILE = "Default"
@@ -33,7 +36,8 @@ class ProfileManager:
                         "active_profiles": content.get("active_profiles", {}),
                         "profiles": content.get("profiles", {}),
                     }
-        except Exception:
+        except Exception as exc:
+            logger.warning("Failed to load profiles from %s: %s", self._file, exc)
             self._data = {"active_profiles": {}, "profiles": {}}
 
     def _save(self):
@@ -44,8 +48,8 @@ class ProfileManager:
             with open(temp_file, "w", encoding="utf-8") as f:
                 json.dump(self._data, f, indent=2, ensure_ascii=False)
             temp_file.replace(self._file)
-        except Exception as e:
-            print(f"Error saving profiles: {e}")
+        except Exception as exc:
+            logger.error("Failed to save profiles to %s: %s", self._file, exc)
 
     def get_profiles(self, device_key: str) -> List[str]:
         dev_profiles = self._data["profiles"].get(device_key, {})

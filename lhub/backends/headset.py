@@ -1,9 +1,20 @@
 import json
+import logging
 import shutil
 import subprocess
 import time
 from typing import List, Dict, Any
 from .base import BaseBackend, Device, DeviceType, Capability, BatteryInfo
+
+logger = logging.getLogger(__name__)
+
+
+def _stderr_text(stderr: Any) -> str:
+    if isinstance(stderr, bytes):
+        return stderr.decode("utf-8", errors="replace").strip()
+    if isinstance(stderr, str):
+        return stderr.strip()
+    return ""
 
 
 # Logitech charging curve for Li-Ion battery under ~500mA USB charge rate
@@ -66,6 +77,15 @@ class HeadsetBackend(BaseBackend):
                 timeout=4,
             )
             if res.returncode != 0 or not res.stdout:
+                err_msg = _stderr_text(res.stderr)
+                if res.returncode != 0:
+                    lower_err = err_msg.lower()
+                    if any(tok in lower_err for tok in ("permission", "denied", "access")):
+                        logger.warning("headsetcontrol scan failed (rc=%d): %s", res.returncode, err_msg)
+                    else:
+                        logger.debug("headsetcontrol returned rc=%d: %s", res.returncode, err_msg or "no output")
+                else:
+                    logger.debug("headsetcontrol produced empty output")
                 return []
 
             data = json.loads(res.stdout)
@@ -123,8 +143,10 @@ class HeadsetBackend(BaseBackend):
                 )
                 devices.append(dev)
 
-        except Exception:
-            pass
+        except subprocess.TimeoutExpired:
+            logger.warning("Timed out running headsetcontrol scan")
+        except Exception as exc:
+            logger.warning("HeadsetBackend scan failed: %s", exc)
 
         return devices
 
@@ -145,8 +167,14 @@ class HeadsetBackend(BaseBackend):
             if res.returncode == 0:
                 self._saved_sidetone[device_id] = level
                 return True
-        except Exception:
-            pass
+            logger.warning(
+                "headsetcontrol set_sidetone failed for %s (rc=%d): %s",
+                device_id,
+                res.returncode,
+                _stderr_text(res.stderr),
+            )
+        except Exception as exc:
+            logger.warning("Failed to set sidetone on %s: %s", device_id, exc)
         return False
 
     def set_inactive_time(self, device_id: str, minutes: int) -> bool:
@@ -164,8 +192,14 @@ class HeadsetBackend(BaseBackend):
             if res.returncode == 0:
                 self._saved_inactive[device_id] = minutes
                 return True
-        except Exception:
-            pass
+            logger.warning(
+                "headsetcontrol set_inactive_time failed for %s (rc=%d): %s",
+                device_id,
+                res.returncode,
+                _stderr_text(res.stderr),
+            )
+        except Exception as exc:
+            logger.warning("Failed to set inactive time on %s: %s", device_id, exc)
         return False
 
     def _process_battery_info(self, dev_id: str, vendor: str, bat_data: Any) -> BatteryInfo:

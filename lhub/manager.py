@@ -1,9 +1,10 @@
+import logging
 import math
 import time
 import threading
 from typing import List, Dict, Any, Optional, Set, Tuple
 from PySide6.QtCore import QObject, Signal, Slot, Property, QTimer, QEvent, Qt
-from PySide6.QtGui import QKeyEvent, QKeySequence
+from PySide6.QtGui import QGuiApplication, QKeyEvent, QKeySequence
 
 from .backends import (
     Device,
@@ -20,7 +21,10 @@ from .backends.ratbag import (
     format_key_combo,
     actions_match,
 )
+from .health import log_health_checks, run_health_checks, SEVERITY_ERROR
 from .profiles import ProfileManager
+
+logger = logging.getLogger(__name__)
 
 
 _QT_MODIFIER_KEYS: Dict[int, str] = {
@@ -112,6 +116,7 @@ class DeviceManager(QObject):
 
     devicesChanged = Signal()
     statusChanged = Signal()
+    healthChecksChanged = Signal()
     batteryWarning = Signal(str, int)  # device_name, percentage
     onboardProfileChanged = Signal(str, str)  # device_name, profile_label
     testStateChanged = Signal()
@@ -130,6 +135,8 @@ class DeviceManager(QObject):
         ]
         self._devices: List[Device] = []
         self._cached_dict_devices: List[Dict[str, Any]] = []
+        self._health_checks: List[Dict[str, Any]] = []
+        self._last_health_signature: Optional[Tuple[Tuple[str, str, str, str], ...]] = None
         self._is_scanning = False
         self._warned_devices: Set[str] = set()
         self._hidpp_monitors: Dict[str, hidpp.OnboardProfileMonitor] = {}
@@ -184,8 +191,15 @@ class DeviceManager(QObject):
                     try:
                         devs = b.scan_devices()
                         detected.extend(devs)
-                    except Exception:
-                        pass
+                    except Exception as exc:
+                        logger.warning(
+                            "Backend %s scan failed: %s",
+                            b.name,
+                            exc,
+                            exc_info=logger.isEnabledFor(logging.DEBUG),
+                        )
+                else:
+                    logger.debug("Backend %s unavailable: %s", b.name, b.get_missing_reason() or "not found")
 
             merged = self._merge_devices(detected)
 
@@ -197,7 +211,6 @@ class DeviceManager(QObject):
                     dpi_val = d.dpi.current if (d.dpi and not d.dpi.is_disabled) else None
                     self.profile_mgr.ensure_default_profile(dev_key, b_map, dpi_val)
 
-
             # Check low battery warnings
             self._check_battery_warnings(merged)
 
@@ -207,7 +220,9 @@ class DeviceManager(QObject):
             self._devices = merged
             self._cached_dict_devices = dict_devs
             self._sync_hidpp_monitors(merged)
+            logger.debug("Device scan complete: %d device(s) active", len(merged))
             self.devicesChanged.emit()
+            self._update_health_checks(merged)
             self.statusChanged.emit()
         finally:
             self._is_scanning = False
@@ -248,6 +263,8 @@ class DeviceManager(QObject):
                         )
                         if mon.start():
                             self._hidpp_monitors[dev_key] = mon
+                        else:
+                            logger.debug("HID++ onboard profile monitor unavailable for %s", dev_key)
 
             for stale_key in list(self._hidpp_monitors.keys()):
                 if stale_key not in active_keys:
@@ -431,6 +448,55 @@ class DeviceManager(QObject):
                 if msg:
                     missing.append(msg)
         return missing
+
+    def _update_health_checks(self, devices: Optional[List[Device]] = None) -> List[Dict[str, Any]]:
+        items = run_health_checks(devices=devices, log_results=False)
+        signature = tuple((i.id, i.severity, i.title, i.description) for i in items)
+        if signature != self._last_health_signature:
+            self._last_health_signature = signature
+            log_health_checks(items)
+        else:
+            logger.debug(
+                "System health unchanged (%d checks, %d issues)",
+                len(items),
+                sum(1 for i in items if i.is_issue),
+            )
+        self._health_checks = [i.to_dict() for i in items]
+        self.healthChecksChanged.emit()
+        return self._health_checks
+
+    @Property("QVariantList", notify=healthChecksChanged)
+    def healthChecks(self) -> List[Dict[str, Any]]:
+        return self._health_checks
+
+    @Property("QVariantList", notify=healthChecksChanged)
+    def healthIssues(self) -> List[Dict[str, Any]]:
+        issues = [item for item in self._health_checks if item.get("isIssue")]
+        issues.sort(key=lambda item: 0 if item.get("severity") == SEVERITY_ERROR else 1)
+        return issues
+
+    @Property(bool, notify=healthChecksChanged)
+    def hasHealthIssues(self) -> bool:
+        return any(item.get("isIssue") for item in self._health_checks)
+
+    @Slot()
+    def refreshHealth(self):
+        devices_snapshot = list(self._devices)
+        threading.Thread(
+            target=lambda: self._update_health_checks(devices_snapshot),
+            daemon=True,
+        ).start()
+
+    @Slot(str, result=bool)
+    def copyToClipboard(self, text: str) -> bool:
+        if not text:
+            return False
+        clipboard = QGuiApplication.clipboard()
+        if clipboard is None:
+            logger.warning("Clipboard is unavailable; could not copy text")
+            return False
+        clipboard.setText(text)
+        return True
 
     @Slot(str, int, result=bool)
     def setDpi(self, device_id: str, dpi: int) -> bool:
@@ -723,6 +789,8 @@ class DeviceManager(QObject):
             )
             if mon.start():
                 self._hid_input_monitor = mon
+            else:
+                logger.debug("Raw hidraw monitor unavailable for %s; using Qt events", device_id)
 
         self.testResultChanged.emit()
         self.testStateChanged.emit()
@@ -869,8 +937,8 @@ class DeviceManager(QObject):
             if val > 0:
                 btn_num = int(math.log2(val)) + 1
                 return f"button {btn_num}", f"Button {btn_num}"
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug("Could not map Qt mouse button %r: %s", btn, exc)
         return "unknown", "Unknown Mouse Button"
 
     def _map_key_event(

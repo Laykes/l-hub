@@ -1,3 +1,4 @@
+import logging
 import shutil
 import subprocess
 from pathlib import Path
@@ -7,6 +8,8 @@ from PySide6.QtGui import QIcon, QAction
 from PySide6.QtCore import QObject
 
 from .single_instance import restore_window
+
+logger = logging.getLogger(__name__)
 
 ICON_PATH = Path(__file__).resolve().parent / "assets" / "io.github.lhub.LHub.svg"
 
@@ -110,8 +113,8 @@ class LHubTray(QObject):
                     stdout=subprocess.DEVNULL,
                     stderr=subprocess.DEVNULL,
                 )
-            except OSError:
-                pass
+            except OSError as exc:
+                logger.warning("Failed to send desktop notification via notify-send: %s", exc)
 
     def _on_battery_warning(self, name: str, percentage: int):
         self._notify(

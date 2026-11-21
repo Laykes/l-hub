@@ -1,10 +1,21 @@
+import logging
 import re
 import shutil
 import subprocess
 import time
-from typing import List, Optional, Dict, Tuple
+from typing import Any, List, Optional, Dict, Tuple
 from .base import BaseBackend, Device, DeviceType, Capability, DpiInfo, ButtonMapping
 from . import hidpp
+
+logger = logging.getLogger(__name__)
+
+
+def _stderr_text(stderr: Any) -> str:
+    if isinstance(stderr, bytes):
+        return stderr.decode("utf-8", errors="replace").strip()
+    if isinstance(stderr, str):
+        return stderr.strip()
+    return ""
 
 
 ACTION_DISPLAY_NAMES: Dict[str, str] = {
@@ -410,11 +421,13 @@ class RatbagBackend(BaseBackend):
                 text=True,
                 timeout=6,
             )
-            if res.returncode != 0:
+            stdout_txt = (res.stdout or "").strip()
+            if res.returncode != 0 or "unable to connect to ratbagd" in stdout_txt.lower():
+                detail = _stderr_text(res.stderr) or stdout_txt or "no output"
+                logger.warning("ratbagctl list failed (rc=%d): %s", res.returncode, detail)
                 return []
 
-
-            lines = res.stdout.strip().splitlines()
+            lines = stdout_txt.splitlines()
             for line in lines:
                 if ":" not in line:
                     continue
@@ -426,8 +439,8 @@ class RatbagBackend(BaseBackend):
                 if dev:
                     devices.append(dev)
 
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.warning("RatbagBackend scan_devices failed: %s", exc)
 
         return devices
 
@@ -440,6 +453,12 @@ class RatbagBackend(BaseBackend):
                 timeout=8,
             )
             if info_res.returncode != 0:
+                logger.warning(
+                    "ratbagctl %s info failed (rc=%d): %s",
+                    dev_id,
+                    info_res.returncode,
+                    _stderr_text(info_res.stderr),
+                )
                 return None
 
             lines = info_res.stdout.splitlines()
@@ -458,8 +477,8 @@ class RatbagBackend(BaseBackend):
                 elif "Number of Buttons:" in line_s:
                     try:
                         num_buttons = int(line_s.split(":", 1)[1].strip())
-                    except ValueError:
-                        pass
+                    except ValueError as exc:
+                        logger.debug("Failed to parse button count for %s: %s", dev_id, exc)
                 else:
                     pm = re.match(r"Profile\s+(\d+):", line_s)
                     if pm:
@@ -557,7 +576,8 @@ class RatbagBackend(BaseBackend):
                 status_note=status_note,
                 backend_name=self.name,
             )
-        except Exception:
+        except Exception as exc:
+            logger.warning("Failed to inspect ratbag device %s: %s", dev_id, exc)
             return None
 
     def _get_dpi(
@@ -610,7 +630,8 @@ class RatbagBackend(BaseBackend):
                         info.current = val
             elif current_from_lines:
                 info.current = current_from_lines
-        except Exception:
+        except Exception as exc:
+            logger.debug("ratbagctl dpi get failed for %s: %s", dev_id, exc)
             if current_from_lines:
                 info.current = current_from_lines
 
@@ -672,8 +693,8 @@ class RatbagBackend(BaseBackend):
                         default_action=meta["default"],
                     )
                 )
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.debug("Failed to read button %d for %s: %s", idx, dev_id, exc)
         return buttons
 
     def set_dpi(self, device_id: str, dpi: int) -> bool:
@@ -696,6 +717,13 @@ class RatbagBackend(BaseBackend):
                 )
                 if res.returncode == 0:
                     return True
+                logger.debug(
+                    "ratbagctl resolution active set %s failed for %s (rc=%d): %s",
+                    slot_idx,
+                    device_id,
+                    res.returncode,
+                    _stderr_text(res.stderr),
+                )
 
             # If not in resolution slots or resolution switch failed, set DPI directly
             res = subprocess.run(
@@ -706,6 +734,13 @@ class RatbagBackend(BaseBackend):
             )
             if res.returncode == 0:
                 return True
+            logger.debug(
+                "ratbagctl dpi set %d failed for %s (rc=%d): %s; attempting recovery",
+                dpi,
+                device_id,
+                res.returncode,
+                _stderr_text(res.stderr),
+            )
             # Recovery: ensure an active resolution exists and retry
             subprocess.run([self._ctl, device_id, "resolution", "active", "set", "0"], timeout=3)
             retry = subprocess.run(
@@ -714,8 +749,17 @@ class RatbagBackend(BaseBackend):
                 text=True,
                 timeout=4,
             )
+            if retry.returncode != 0:
+                logger.warning(
+                    "ratbagctl dpi set %d failed after recovery for %s (rc=%d): %s",
+                    dpi,
+                    device_id,
+                    retry.returncode,
+                    _stderr_text(retry.stderr),
+                )
             return retry.returncode == 0
-        except Exception:
+        except Exception as exc:
+            logger.warning("Failed to set DPI %d on %s: %s", dpi, device_id, exc)
             return False
 
     def remap_button(self, device_id: str, button_idx: int, action: str) -> bool:
@@ -739,10 +783,18 @@ class RatbagBackend(BaseBackend):
                 timeout=8,
             )
             if res.returncode != 0:
+                logger.warning(
+                    "ratbagctl remap_button failed for %s button %d (rc=%d): %s",
+                    device_id,
+                    button_idx,
+                    res.returncode,
+                    _stderr_text(res.stderr),
+                )
                 return False
             self._finalize_hidpp_commit(device_id, hidpp_profile_id)
             return True
-        except Exception:
+        except Exception as exc:
+            logger.warning("Failed to remap button %d on %s: %s", button_idx, device_id, exc)
             return False
 
     def batch_remap_buttons(self, device_id: str, buttons: Dict[int, str]) -> bool:
@@ -771,12 +823,28 @@ class RatbagBackend(BaseBackend):
                 res = subprocess.run(cmd, capture_output=True, timeout=8 if is_last else 3)
                 if is_last:
                     last_ok = (res.returncode == 0)
+                    if not last_ok:
+                        logger.warning(
+                            "ratbagctl batch_remap commit failed for %s (rc=%d): %s",
+                            device_id,
+                            res.returncode,
+                            _stderr_text(res.stderr),
+                        )
                 else:
+                    if res.returncode != 0:
+                        logger.debug(
+                            "ratbagctl --nocommit step failed for %s button %d (rc=%d): %s",
+                            device_id,
+                            idx,
+                            res.returncode,
+                            _stderr_text(res.stderr),
+                        )
                     time.sleep(0.04)
             if last_ok:
                 self._finalize_hidpp_commit(device_id, hidpp_profile_id)
             return True
-        except Exception:
+        except Exception as exc:
+            logger.warning("Failed batch remap on %s: %s", device_id, exc)
             return False
 
     def reset_defaults(self, device_id: str) -> bool:
@@ -828,6 +896,7 @@ class RatbagBackend(BaseBackend):
             target_dpi = 1600 if (dev and dev.dpi and 1600 in dev.dpi.steps) else 800
             self.set_dpi(device_id, target_dpi)
             return True
-        except Exception:
+        except Exception as exc:
+            logger.warning("Failed resetting defaults on %s: %s", device_id, exc)
             return False
 
