@@ -17,6 +17,7 @@ from .backends import (
 )
 from .backends.ratbag import parse_button_action
 from .button_tester import ButtonTesterController
+from .device_layouts import get_factory_reset_defaults
 from .health import SEVERITY_ERROR, log_health_checks, run_health_checks
 from .keymap import resolve_key_action
 from .profiles import ProfileManager
@@ -530,28 +531,21 @@ class DeviceManager(QObject):
             return False
         dev_key = get_device_key(dev)
 
-        defaults_map = {
-            0: ("button 1", "Left Click"),
-            1: ("button 2", "Right Click"),
-            2: ("button 3", "Middle Click"),
-            3: ("button 4", "Back (Button 4)"),
-            4: ("special resolution-alternate", "DPI Shift (Sniper)"),
-            5: ("button 5", "Forward (Button 5)"),
-            6: ("special wheel-left", "Scroll Wheel Left"),
-            7: ("special wheel-right", "Scroll Wheel Right"),
-            8: ("special profile-cycle-up", "Cycle Profile"),
-            9: ("special resolution-up", "DPI +"),
-            10: ("special resolution-down", "DPI -"),
-        }
+        defaults = get_factory_reset_defaults(
+            dev.name,
+            dev.usb_vid or "",
+            dev.usb_pid or "",
+            total_buttons=len(dev.buttons) if dev.buttons else None,
+        )
 
         # Update local cache immediately
         for d in self._cached_dict_devices:
             if d["id"] == device_id:
                 d["activeProfile"] = "Default"
                 for btn in d.get("buttons", []):
-                    if btn["index"] in defaults_map:
-                        btn["action"] = defaults_map[btn["index"]][0]
-                        btn["actionDisplay"] = defaults_map[btn["index"]][1]
+                    if btn["index"] in defaults:
+                        norm_act, norm_disp = parse_button_action(defaults[btn["index"]])
+                        _apply_button_dict_action(btn, norm_act, norm_disp)
                 self.devicesChanged.emit()
                 break
 

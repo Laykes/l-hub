@@ -6,6 +6,11 @@ import time
 from typing import Any, List, Optional, Dict, Tuple
 from .base import BaseBackend, Device, DeviceType, Capability, DpiInfo, ButtonMapping
 from . import hidpp
+from ..device_layouts import (
+    find_device_layout,
+    get_button_metadata as _get_button_metadata,
+    get_factory_reset_defaults,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -270,64 +275,8 @@ def actions_match(configured_action: str, detected_action: str, relaxed_modifier
 
 
 def get_button_metadata(dev_name: str, vid: str, pid: str, b_idx: int, act_val: str, total_buttons: int) -> Dict[str, str]:
-    name_lower = dev_name.lower()
-    is_g502 = "g502" in name_lower or (vid == "046d" and pid in ("c099", "c092", "c07d", "c332", "c08b"))
-
-    if is_g502:
-        g502_meta = {
-            0: {"name": "Left Click (LMB)", "label": "Left Click", "location": "Primary Left", "group": "main", "default": "button 1"},
-            1: {"name": "Right Click (RMB)", "label": "Right Click", "location": "Primary Right", "group": "main", "default": "button 2"},
-            2: {"name": "Middle Click (Wheel)", "label": "Wheel Click", "location": "Scroll Wheel", "group": "wheel", "default": "button 3"},
-            3: {"name": "Side Back (G4)", "label": "Back", "location": "Thumb Rest (Rear)", "group": "side", "default": "button 4"},
-            4: {"name": "DPI Shift / Sniper (G6)", "label": "Sniper / Shift", "location": "Thumb Tip (Front)", "group": "side", "default": "special resolution-alternate"},
-            5: {"name": "Side Forward (G5)", "label": "Forward", "location": "Thumb Rest (Front)", "group": "side", "default": "button 5"},
-            6: {"name": "Wheel Tilt Left", "label": "Tilt Left", "location": "Scroll Wheel", "group": "wheel", "default": "special wheel-left"},
-            7: {"name": "Wheel Tilt Right", "label": "Tilt Right", "location": "Scroll Wheel", "group": "wheel", "default": "special wheel-right"},
-            8: {"name": "Profile Switch (G9)", "label": "Profile Switch", "location": "Behind Wheel", "group": "dpi", "default": "special profile-cycle-up"},
-            9: {"name": "DPI Up (G8)", "label": "DPI Up", "location": "Left of LMB", "group": "dpi", "default": "special resolution-up"},
-            10: {"name": "DPI Down (G7)", "label": "DPI Down", "location": "Left of LMB", "group": "dpi", "default": "special resolution-down"},
-        }
-        if b_idx in g502_meta:
-            return g502_meta[b_idx]
-
-    if b_idx == 0:
-        return {"name": "Left Click", "label": "Left Click", "location": "Primary Left", "group": "main", "default": "button 1"}
-    if b_idx == 1:
-        return {"name": "Right Click", "label": "Right Click", "location": "Primary Right", "group": "main", "default": "button 2"}
-    if b_idx == 2:
-        return {"name": "Middle Click", "label": "Wheel Click", "location": "Scroll Wheel", "group": "wheel", "default": "button 3"}
-    if b_idx == 3:
-        return {"name": "Side Back (Button 4)", "label": "Back", "location": "Side Thumb", "group": "side", "default": "button 4"}
-    if b_idx == 4 and total_buttons <= 6:
-        return {"name": "Side Forward (Button 5)", "label": "Forward", "location": "Side Thumb", "group": "side", "default": "button 5"}
-
-    act_lower = act_val.lower()
-    if "wheel-left" in act_lower:
-        return {"name": "Wheel Tilt Left", "label": "Tilt Left", "location": "Scroll Wheel", "group": "wheel", "default": "special wheel-left"}
-    if "wheel-right" in act_lower:
-        return {"name": "Wheel Tilt Right", "label": "Tilt Right", "location": "Scroll Wheel", "group": "wheel", "default": "special wheel-right"}
-    if "resolution-alternate" in act_lower or "sniper" in act_lower:
-        return {"name": "DPI Shift / Sniper", "label": "Sniper", "location": "Thumb Rest", "group": "side", "default": "special resolution-alternate"}
-    if "resolution-up" in act_lower:
-        return {"name": "DPI Up", "label": "DPI Up", "location": "Top Controls", "group": "dpi", "default": "special resolution-up"}
-    if "resolution-down" in act_lower:
-        return {"name": "DPI Down", "label": "DPI Down", "location": "Top Controls", "group": "dpi", "default": "special resolution-down"}
-    if "resolution-cycle" in act_lower:
-        return {"name": "Cycle DPI", "label": "Cycle DPI", "location": "Top Controls", "group": "dpi", "default": "special resolution-cycle-up"}
-    if "profile-cycle" in act_lower:
-        return {"name": "Cycle Profile", "label": "Cycle Profile", "location": "Top Controls", "group": "dpi", "default": "special profile-cycle-up"}
-    if act_lower == "button 4":
-        return {"name": "Side Back (Button 4)", "label": "Back", "location": "Side Thumb", "group": "side", "default": "button 4"}
-    if act_lower == "button 5":
-        return {"name": "Side Forward (Button 5)", "label": "Forward", "location": "Side Thumb", "group": "side", "default": "button 5"}
-
-    return {
-        "name": f"Button {b_idx + 1}",
-        "label": f"Button {b_idx + 1}",
-        "location": "Mouse",
-        "group": "main" if b_idx < 3 else ("side" if b_idx < 6 else "dpi"),
-        "default": f"button {b_idx + 1}",
-    }
+    """Return button metadata from matching device layout JSON or generic fallback."""
+    return _get_button_metadata(dev_name, vid, pid, b_idx, act_val, total_buttons)
 
 
 def parse_button_action(raw_val: str) -> Tuple[str, str]:
@@ -462,6 +411,8 @@ class RatbagBackend(BaseBackend):
                 return None
 
             lines = info_res.stdout.splitlines()
+            if not dev_name and lines and " - " in lines[0]:
+                dev_name = lines[0].split(" - ", 1)[1].strip()
             vid, pid = "", ""
             num_buttons = 0
             profiles: Dict[int, Dict[str, object]] = {}
@@ -561,10 +512,17 @@ class RatbagBackend(BaseBackend):
                         dev_id, num_buttons, dev_name, vid, pid, profile_idx=selected_profile_idx
                     )
 
+            layout = find_device_layout(dev_name, vid, pid)
+            vendor = (
+                layout.vendor
+                if layout is not None
+                else ("Logitech" if "logitech" in dev_name.lower() or "046d" in vid else "Generic")
+            )
+
             return Device(
                 id=dev_id,
                 name=dev_name,
-                vendor="Logitech" if "logitech" in dev_name.lower() or "046d" in vid else "Generic",
+                vendor=vendor,
                 device_type=DeviceType.MOUSE,
                 usb_vid=vid,
                 usb_pid=pid,
@@ -855,30 +813,18 @@ class RatbagBackend(BaseBackend):
             subprocess.run([self._ctl, device_id, "profile", "1", "enable"], capture_output=True, timeout=3)
 
             dev = self._inspect_device(device_id, "")
-            num_buttons = len(dev.buttons) if (dev and dev.buttons) else 11
+            cached_vid, cached_pid = self._usb_ids.get(device_id, ("", ""))
+            dev_name = dev.name if dev else ""
+            vid = (dev.usb_vid if dev and dev.usb_vid else cached_vid) or ""
+            pid = (dev.usb_pid if dev and dev.usb_pid else cached_pid) or ""
+            total_buttons = len(dev.buttons) if (dev and dev.buttons) else None
 
-            if num_buttons >= 11:
-                defaults = {
-                    0: "button 1",
-                    1: "button 2",
-                    2: "button 3",
-                    3: "button 4",
-                    4: "special resolution-alternate",
-                    5: "button 5",
-                    6: "special wheel-left",
-                    7: "special wheel-right",
-                    8: "special profile-cycle-up",
-                    9: "special resolution-up",
-                    10: "special resolution-down",
-                }
-            else:
-                defaults = {
-                    0: "button 1",
-                    1: "button 2",
-                    2: "button 3",
-                    3: "button 4",
-                    4: "button 5",
-                }
+            defaults = get_factory_reset_defaults(
+                dev_name=dev_name,
+                vid=vid,
+                pid=pid,
+                total_buttons=total_buttons,
+            )
 
             # Apply defaults to active profile
             self.batch_remap_buttons(device_id, defaults)
