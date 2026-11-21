@@ -5,7 +5,16 @@ from unittest.mock import MagicMock, patch
 from PySide6.QtWidgets import QSystemTrayIcon
 
 from lhub.backends.base import Device, DeviceType, Capability, BatteryInfo
+from lhub.backends.dbus_client import DBUS_PROPERTIES_IFACE, DBusSignalEvent
 from lhub.backends.headset import HeadsetBackend, _estimate_logitech_charging_percentage
+from lhub.backends.upower import (
+    UPOWER_DEVICE_IFACE,
+    UPOWER_DISPLAY_DEVICE_PATH,
+    UPOWER_IFACE,
+    UPOWER_PATH,
+    UPOWER_SERVICE,
+    UPowerBackend,
+)
 from lhub.manager import DeviceManager
 from lhub.tray import LHubTray
 
@@ -146,16 +155,16 @@ class TestBatteryHandling(unittest.TestCase):
             battery=BatteryInfo(percentage=100, is_charging=True, time_to_full_min=0),
         )
 
-        with patch.object(DeviceManager, "refresh_devices"):
-            manager = DeviceManager()
-            d_discharging = manager._device_to_dict(dev_discharging)
-            self.assertEqual(d_discharging["batteryTimeRemaining"], "~3 hr 0 min")
+        manager = DeviceManager(auto_refresh=False, enable_hotplug=False)
+        self.addCleanup(manager.cleanup)
+        d_discharging = manager._device_to_dict(dev_discharging)
+        self.assertEqual(d_discharging["batteryTimeRemaining"], "~3 hr 0 min")
 
-            d_charging = manager._device_to_dict(dev_charging)
-            self.assertEqual(d_charging["batteryTimeRemaining"], "Full in ~1 hr 44 min")
+        d_charging = manager._device_to_dict(dev_charging)
+        self.assertEqual(d_charging["batteryTimeRemaining"], "Full in ~1 hr 44 min")
 
-            d_full = manager._device_to_dict(dev_full)
-            self.assertEqual(d_full["batteryTimeRemaining"], "Fully charged")
+        d_full = manager._device_to_dict(dev_full)
+        self.assertEqual(d_full["batteryTimeRemaining"], "Fully charged")
 
     def _make_battery_device(
         self,
@@ -268,6 +277,194 @@ class TestBatteryHandling(unittest.TestCase):
             self.assertEqual(cmd[0], "/usr/bin/notify-send")
             self.assertIn("Low Battery", cmd)
             self.assertIn("Test Headset battery is down to 15%!", cmd)
+
+
+class TestUPowerDBusBackend(unittest.TestCase):
+    def test_scan_devices_enumerates_peripherals_and_filters_power_supplies(self):
+        mouse_path = "/org/freedesktop/UPower/devices/mouse_hidpp_battery_0"
+        kb_path = "/org/freedesktop/UPower/devices/keyboard_dev_aa_bb_cc"
+        ctrl_path = "/org/freedesktop/UPower/devices/battery_ps_controller_battery_1"
+        headset_path = "/org/freedesktop/UPower/devices/headset_dev_11_22"
+        bt_path = "/org/freedesktop/UPower/devices/bluetooth_generic_dev_33"
+        laptop_bat = "/org/freedesktop/UPower/devices/battery_BAT0"
+        line_ac = "/org/freedesktop/UPower/devices/line_power_AC"
+        absent_mouse = "/org/freedesktop/UPower/devices/mouse_absent"
+
+        props_by_path = {
+            mouse_path: {
+                "Type": 5,
+                "PowerSupply": False,
+                "IsPresent": True,
+                "Model": "Logitech MX Master 3S",
+                "Vendor": "Logitech",
+                "Percentage": 64.6,
+                "State": 2,
+                "TimeToEmpty": 7200,
+                "TimeToFull": 0,
+                "NativePath": "/sys/devices/pci0000:00/0003:046D:B034.0002/power_supply/hidpp_battery_0",
+            },
+            kb_path: {
+                "Type": 6,
+                "PowerSupply": False,
+                "IsPresent": True,
+                "Model": "Keychron K8",
+                "Vendor": "",
+                "Percentage": 30.0,
+                "State": 1,
+                "TimeToEmpty": 0,
+                "TimeToFull": 3600,
+                "NativePath": "/sys/devices/virtual/misc/uhid/0005:3434:0280.0004/power_supply/bat",
+            },
+            ctrl_path: {
+                "Type": 12,
+                "PowerSupply": False,
+                "IsPresent": True,
+                "Model": "Sony Interactive Entertainment Wireless Controller",
+                "Vendor": "",
+                "Percentage": 100.0,
+                "State": 4,  # Fully charged -> must NOT mark is_charging=True
+                "TimeToEmpty": 0,
+                "TimeToFull": 0,
+                "NativePath": "ps-controller-battery-f4:93:9f:b9:9f:ef",
+            },
+            headset_path: {
+                "Type": 17,
+                "PowerSupply": False,
+                "IsPresent": True,
+                "Model": "SteelSeries Arctis Nova",
+                "Vendor": "SteelSeries",
+                "Percentage": 80.0,
+                "State": 5,  # Pending charge
+                "NativePath": "",
+            },
+            bt_path: {
+                "Type": 28,
+                "PowerSupply": False,
+                "IsPresent": True,
+                "Model": "Generic BT Peripheral",
+                "Vendor": "Generic",
+                "Percentage": 55.0,
+                "State": 2,
+                "NativePath": "",
+            },
+            laptop_bat: {
+                "Type": 2,
+                "PowerSupply": True,
+                "IsPresent": True,
+                "Model": "BAT0",
+                "Percentage": 90.0,
+                "State": 2,
+            },
+            absent_mouse: {
+                "Type": 5,
+                "PowerSupply": False,
+                "IsPresent": False,
+                "Model": "Absent Mouse",
+                "Percentage": 0.0,
+                "State": 0,
+            },
+        }
+
+        dbus = MagicMock()
+        dbus.is_bus_available.return_value = True
+        dbus.has_name_owner.return_value = True
+        dbus.call_method.return_value = (
+            [
+                UPOWER_DISPLAY_DEVICE_PATH,
+                line_ac,
+                laptop_bat,
+                absent_mouse,
+                mouse_path,
+                kb_path,
+                ctrl_path,
+                headset_path,
+                bt_path,
+            ],
+        )
+        dbus.get_all_properties.side_effect = lambda svc, path, iface: dict(props_by_path.get(path, {}))
+
+        backend = UPowerBackend(dbus_client=dbus)
+        devices = backend.scan_devices()
+        by_id = {d.id: d for d in devices}
+
+        self.assertEqual(len(devices), 5)
+        self.assertNotIn("upower_battery_BAT0", by_id)
+        self.assertNotIn("upower_DisplayDevice", by_id)
+        self.assertNotIn("upower_line_power_AC", by_id)
+        self.assertNotIn("upower_mouse_absent", by_id)
+
+        mouse = by_id["upower_mouse_hidpp_battery_0"]
+        self.assertEqual(mouse.device_type, DeviceType.MOUSE)
+        self.assertEqual(mouse.usb_vid, "046d")
+        self.assertEqual(mouse.usb_pid, "b034")
+        self.assertEqual(mouse.battery.percentage, 65)
+        self.assertFalse(mouse.battery.is_charging)
+        self.assertEqual(mouse.battery.time_to_empty_min, 120)
+        self.assertEqual(mouse.battery.status_text, "Discharging")
+
+        kb = by_id["upower_keyboard_dev_aa_bb_cc"]
+        self.assertEqual(kb.device_type, DeviceType.KEYBOARD)
+        self.assertEqual(kb.vendor, "Keychron")
+        self.assertEqual(kb.usb_vid, "3434")
+        self.assertEqual(kb.usb_pid, "0280")
+        self.assertTrue(kb.battery.is_charging)
+        self.assertEqual(kb.battery.time_to_full_min, 60)
+
+        ctrl = by_id["upower_battery_ps_controller_battery_1"]
+        self.assertEqual(ctrl.device_type, DeviceType.OTHER)
+        self.assertEqual(ctrl.battery.percentage, 100)
+        self.assertFalse(ctrl.battery.is_charging)
+        self.assertEqual(ctrl.battery.status_text, "Fully charged")
+
+        headset = by_id["upower_headset_dev_11_22"]
+        self.assertEqual(headset.device_type, DeviceType.HEADSET)
+        self.assertTrue(headset.battery.is_charging)
+        self.assertEqual(headset.battery.status_text, "Pending charge")
+
+        self.assertIn(laptop_bat, backend._ignored_paths)
+
+    def test_hotplug_signal_subscriptions_and_filtering(self):
+        callbacks = []
+        sub_counter = {"n": 0}
+
+        def fake_subscribe(svc, path, iface, sig, cb):
+            sub_counter["n"] += 1
+            callbacks.append((svc, path, iface, sig, cb, sub_counter["n"]))
+            return sub_counter["n"]
+
+        dbus = MagicMock()
+        dbus.subscribe_signal.side_effect = fake_subscribe
+        backend = UPowerBackend(dbus_client=dbus)
+        backend._ignored_paths.add("/org/freedesktop/UPower/devices/battery_BAT0")
+
+        changes = []
+        self.assertTrue(backend.supports_hotplug)
+        self.assertTrue(backend.start_monitoring(lambda: changes.append(True)))
+        self.assertEqual(len(callbacks), 4)
+
+        by_sig = {(iface, sig): cb for _svc, _path, iface, sig, cb, _sid in callbacks}
+
+        # DisplayDevice and ignored PowerSupply paths must be ignored on PropertiesChanged
+        prop_cb = by_sig[(DBUS_PROPERTIES_IFACE, "PropertiesChanged")]
+        prop_cb(DBusSignalEvent(UPOWER_SERVICE, UPOWER_DISPLAY_DEVICE_PATH, DBUS_PROPERTIES_IFACE, "PropertiesChanged", (UPOWER_DEVICE_IFACE,)))
+        prop_cb(DBusSignalEvent(UPOWER_SERVICE, "/org/freedesktop/UPower/devices/battery_BAT0", DBUS_PROPERTIES_IFACE, "PropertiesChanged", (UPOWER_DEVICE_IFACE,)))
+        self.assertEqual(len(changes), 0)
+
+        # Peripheral PropertiesChanged triggers callback
+        prop_cb(DBusSignalEvent(UPOWER_SERVICE, "/org/freedesktop/UPower/devices/mouse_1", DBUS_PROPERTIES_IFACE, "PropertiesChanged", (UPOWER_DEVICE_IFACE,)))
+        self.assertEqual(len(changes), 1)
+
+        # DeviceAdded & DeviceRemoved trigger callback
+        by_sig[(UPOWER_IFACE, "DeviceAdded")](
+            DBusSignalEvent(UPOWER_SERVICE, UPOWER_PATH, UPOWER_IFACE, "DeviceAdded", ("/org/freedesktop/UPower/devices/mouse_2",))
+        )
+        by_sig[(UPOWER_IFACE, "DeviceRemoved")](
+            DBusSignalEvent(UPOWER_SERVICE, UPOWER_PATH, UPOWER_IFACE, "DeviceRemoved", ("/org/freedesktop/UPower/devices/mouse_2",))
+        )
+        self.assertEqual(len(changes), 3)
+
+        backend.stop_monitoring()
+        self.assertEqual(dbus.unsubscribe_signal.call_count, 4)
 
 
 if __name__ == "__main__":

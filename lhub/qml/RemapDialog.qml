@@ -2,6 +2,7 @@ import QtQuick
 import QtQuick.Controls as QQC2
 import QtQuick.Layouts
 import org.kde.kirigami as Kirigami
+import "components"
 
 QQC2.Popup {
     id: root
@@ -368,42 +369,16 @@ QQC2.Popup {
             }
 
             // Search Results View
-            ColumnLayout {
+            ActionPresetGrid {
                 visible: root.searchFilter.trim().length > 0
                 Layout.fillWidth: true
                 Layout.fillHeight: true
-                spacing: 10
-
-                Text {
-                    text: root.searchResults.length + " matching actions"
-                    color: theme.textSecondary
-                    font.pixelSize: 12
-                    font.weight: Font.DemiBold
-                }
-
-                Flickable {
-                    Layout.fillWidth: true
-                    Layout.fillHeight: true
-                    contentWidth: width
-                    contentHeight: searchFlow.implicitHeight
-                    clip: true
-
-                    Flow {
-                        id: searchFlow
-                        width: parent.width
-                        spacing: 8
-
-                        Repeater {
-                            model: root.searchResults
-
-                            UiButton {
-                                iconName: modelData.icon || "input-keyboard-symbolic"
-                                text: modelData.label + " · " + modelData.cat
-                                checked: modelData.action === root.currentAction
-                                onClicked: root.selectAction(modelData.action)
-                            }
-                        }
-                    }
+                heading: root.searchResults.length + " matching actions"
+                actions: root.searchResults
+                currentAction: root.currentAction
+                showCategorySuffix: true
+                onActionSelected: function(action) {
+                    root.selectAction(action)
                 }
             }
 
@@ -473,142 +448,42 @@ QQC2.Popup {
                     Layout.fillHeight: true
 
                     // Tab 0: Shortcuts
-                    Flickable {
-                        contentWidth: width
-                        contentHeight: shortcutsCol.implicitHeight
-                        clip: true
-
-                        ColumnLayout {
-                            id: shortcutsCol
-                            width: parent.width
-                            spacing: 10
-
-                            Text {
-                                text: "Common Productivity & System Shortcuts"
-                                color: theme.textSecondary
-                                font.pixelSize: 12
-                                font.weight: Font.DemiBold
-                            }
-
-                            Flow {
-                                Layout.fillWidth: true
-                                spacing: 8
-
-                                Repeater {
-                                    model: root.catalogForCategory("Shortcuts")
-                                    UiButton {
-                                        iconName: modelData.icon
-                                        text: modelData.label
-                                        checked: modelData.action === root.currentAction
-                                        onClicked: root.selectAction(modelData.action)
-                                    }
-                                }
-                            }
+                    ActionPresetGrid {
+                        heading: "Common Productivity & System Shortcuts"
+                        actions: root.catalogForCategory("Shortcuts")
+                        currentAction: root.currentAction
+                        onActionSelected: function(action) {
+                            root.selectAction(action)
                         }
                     }
 
                     // Tab 1: Mouse
-                    Flickable {
-                        contentWidth: width
-                        contentHeight: mouseCol.implicitHeight
-                        clip: true
-
-                        ColumnLayout {
-                            id: mouseCol
-                            width: parent.width
-                            spacing: 10
-
-                            Text {
-                                text: "Standard Mouse Functions"
-                                color: theme.textSecondary
-                                font.pixelSize: 12
-                                font.weight: Font.DemiBold
-                            }
-
-                            Flow {
-                                Layout.fillWidth: true
-                                spacing: 8
-
-                                Repeater {
-                                    model: root.catalogForCategory("Mouse")
-                                    UiButton {
-                                        iconName: modelData.icon
-                                        text: modelData.label
-                                        checked: modelData.action === root.currentAction
-                                        onClicked: root.selectAction(modelData.action)
-                                    }
-                                }
-                            }
+                    ActionPresetGrid {
+                        heading: "Standard Mouse Functions"
+                        actions: root.catalogForCategory("Mouse")
+                        currentAction: root.currentAction
+                        onActionSelected: function(action) {
+                            root.selectAction(action)
                         }
                     }
 
                     // Tab 2: DPI & Sensor
-                    Flickable {
-                        contentWidth: width
-                        contentHeight: dpiCol.implicitHeight
-                        clip: true
-
-                        ColumnLayout {
-                            id: dpiCol
-                            width: parent.width
-                            spacing: 10
-
-                            Text {
-                                text: "Sensor DPI & Profile Switching"
-                                color: theme.textSecondary
-                                font.pixelSize: 12
-                                font.weight: Font.DemiBold
-                            }
-
-                            Flow {
-                                Layout.fillWidth: true
-                                spacing: 8
-
-                                Repeater {
-                                    model: root.catalogForCategory("DPI")
-                                    UiButton {
-                                        iconName: modelData.icon
-                                        text: modelData.label
-                                        checked: modelData.action === root.currentAction
-                                        onClicked: root.selectAction(modelData.action)
-                                    }
-                                }
-                            }
+                    ActionPresetGrid {
+                        heading: "Sensor DPI & Profile Switching"
+                        actions: root.catalogForCategory("DPI")
+                        currentAction: root.currentAction
+                        onActionSelected: function(action) {
+                            root.selectAction(action)
                         }
                     }
 
                     // Tab 3: Media
-                    Flickable {
-                        contentWidth: width
-                        contentHeight: mediaCol.implicitHeight
-                        clip: true
-
-                        ColumnLayout {
-                            id: mediaCol
-                            width: parent.width
-                            spacing: 10
-
-                            Text {
-                                text: "Media Playback & System Volume"
-                                color: theme.textSecondary
-                                font.pixelSize: 12
-                                font.weight: Font.DemiBold
-                            }
-
-                            Flow {
-                                Layout.fillWidth: true
-                                spacing: 8
-
-                                Repeater {
-                                    model: root.catalogForCategory("Media")
-                                    UiButton {
-                                        iconName: modelData.icon
-                                        text: modelData.label
-                                        checked: modelData.action === root.currentAction
-                                        onClicked: root.selectAction(modelData.action)
-                                    }
-                                }
-                            }
+                    ActionPresetGrid {
+                        heading: "Media Playback & System Volume"
+                        actions: root.catalogForCategory("Media")
+                        currentAction: root.currentAction
+                        onActionSelected: function(action) {
+                            root.selectAction(action)
                         }
                     }
 
@@ -623,95 +498,28 @@ QQC2.Popup {
                             width: parent.width
                             spacing: 12
 
-                            // Interactive Key Recorder Card (fixed: translucent tint, full-opacity text)
-                            Rectangle {
-                                id: recorderBox
+                            KeyCaptureBox {
                                 Layout.fillWidth: true
-                                implicitHeight: recRow.implicitHeight + 24
-                                radius: theme.radiusMd
-                                color: root.isRecordingKey ? theme.accentSoft : theme.bgSurface
-                                border.color: root.isRecordingKey ? theme.accent : theme.borderSubtle
-                                border.width: root.isRecordingKey ? 2 : 1
-                                focus: true
+                                isRecording: root.isRecordingKey
+                                recordedAction: root.recordedAction
+                                recordedDisplay: root.recordedDisplay
 
-                                Keys.onPressed: function(event) {
-                                    if (root.isRecordingKey) {
-                                        event.accepted = true
-                                        var res = deviceManager.resolveKeyAction(event.key, event.modifiers)
-                                        if (res && res.action) {
-                                            root.recordedAction = res.action
-                                            root.recordedDisplay = res.display || res.action
-                                            root.isRecordingKey = false
-                                        }
+                                onRecordingToggled: function(active) {
+                                    root.isRecordingKey = active
+                                }
+
+                                onKeyCaptured: function(key, modifiers) {
+                                    if (typeof deviceManager === "undefined" || !deviceManager) return
+                                    var res = deviceManager.resolveKeyAction(key, modifiers)
+                                    if (res && res.action) {
+                                        root.recordedAction = res.action
+                                        root.recordedDisplay = res.display || res.action
+                                        root.isRecordingKey = false
                                     }
                                 }
 
-                                RowLayout {
-                                    id: recRow
-                                    anchors.fill: parent
-                                    anchors.margins: 12
-                                    spacing: 12
-
-                                    Rectangle {
-                                        width: 40
-                                        height: 40
-                                        radius: 10
-                                        color: root.isRecordingKey ? theme.accentMedium : theme.bgControl
-
-                                        Kirigami.Icon {
-                                            anchors.centerIn: parent
-                                            source: "input-keyboard-symbolic"
-                                            width: 20
-                                            height: 20
-                                            isMask: true
-                                            color: root.isRecordingKey ? theme.accent : theme.textSecondary
-                                        }
-                                    }
-
-                                    ColumnLayout {
-                                        Layout.fillWidth: true
-                                        spacing: 2
-
-                                        Text {
-                                            text: root.isRecordingKey
-                                                  ? "Listening for key press..."
-                                                  : (root.recordedDisplay ? ("Captured: " + root.recordedDisplay) : "Live Keyboard Capture")
-                                            color: root.isRecordingKey ? theme.accent : theme.textPrimary
-                                            font.pixelSize: 13
-                                            font.weight: Font.DemiBold
-                                        }
-
-                                        Text {
-                                            text: root.isRecordingKey
-                                                  ? "Press any key or shortcut now (e.g. F5, Ctrl+C, Space, Esc)..."
-                                                  : "Capture any physical key or modifier combo directly from your keyboard."
-                                            color: theme.textSecondary
-                                            font.pixelSize: 11
-                                            wrapMode: Text.WordWrap
-                                            Layout.fillWidth: true
-                                        }
-                                    }
-
-                                    UiButton {
-                                        variant: root.isRecordingKey ? "default" : "primary"
-                                        compact: true
-                                        text: root.isRecordingKey ? "Cancel" : "Record Key"
-                                        iconName: root.isRecordingKey ? "dialog-cancel-symbolic" : "media-record-symbolic"
-                                        onClicked: {
-                                            root.isRecordingKey = !root.isRecordingKey
-                                            if (root.isRecordingKey) {
-                                                recorderBox.forceActiveFocus()
-                                            }
-                                        }
-                                    }
-
-                                    UiButton {
-                                        visible: Boolean(root.recordedAction)
-                                        variant: "primary"
-                                        compact: true
-                                        text: "Assign " + root.recordedDisplay
-                                        onClicked: root.selectAction(root.recordedAction)
-                                    }
+                                onActionAssigned: function(action) {
+                                    root.selectAction(action)
                                 }
                             }
 

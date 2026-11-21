@@ -27,7 +27,8 @@ class TestHeadset(unittest.TestCase):
 
     @patch.object(HeadsetBackend, "set_sidetone")
     def test_manager_set_sidetone_spawns_thread_and_calls_backend(self, mock_backend_sidetone):
-        mgr = DeviceManager()
+        mgr = DeviceManager(auto_refresh=False, enable_hotplug=False)
+        self.addCleanup(mgr.cleanup)
         dev = Device(
             id="headset_046d_0aba",
             name="Test Headset",

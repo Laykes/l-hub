@@ -1,0 +1,55 @@
+{
+  "id": "logitech_g_pro_x_superlight",
+  "name": "Logitech G Pro X Superlight",
+  "vendor": "Logitech",
+  "vid": "046d",
+  "pids": [
+    "4093",
+    "c094"
+  ],
+  "name_patterns": [
+    "g\\s*pro\\s*x\\s*(?:wireless\\s*)?superlight"
+  ],
+  "buttons": [
+    {
+      "index": 0,
+      "name": "Left Click (LMB)",
+      "label": "Left Click",
+      "location": "Primary Left",
+      "group": "main",
+      "default": "button 1"
+    },
+    {
+      "index": 1,
+      "name": "Right Click (RMB)",
+      "label": "Right Click",
+      "location": "Primary Right",
+      "group": "main",
+      "default": "button 2"
+    },
+    {
+      "index": 2,
+      "name": "Middle Click (Wheel)",
+      "label": "Wheel Click",
+      "location": "Scroll Wheel",
+      "group": "wheel",
+      "default": "button 3"
+    },
+    {
+      "index": 3,
+      "name": "Side Back (G4)",
+      "label": "Back",
+      "location": "Side Thumb (Rear)",
+      "group": "side",
+      "default": "button 4"
+    },
+    {
+      "index": 4,
+      "name": "Side Forward (G5)",
+      "label": "Forward",
+      "location": "Side Thumb (Front)",
+      "group": "side",
+      "default": "button 5"
+    }
+  ]
+}

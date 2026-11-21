@@ -9,13 +9,24 @@ environment intercepts them before Qt receives a window event.
 
 from dataclasses import dataclass, field
 import glob
+import logging
 import os
+import re
 import select
 import threading
 import time
 from typing import Callable, Dict, List, Optional, Set, Tuple
 
+from .hidpp import (
+    LOGITECH_VID,
+    _is_generic_receiver_name,
+    _name_match_score,
+    _parse_uevent_lines,
+    is_receiver_pid,
+)
 from .ratbag import ACTION_DISPLAY_NAMES, KEY_DISPLAY_NAMES, format_key_combo
+
+logger = logging.getLogger(__name__)
 
 
 MODIFIER_HOLD_TIMEOUT = 0.35
@@ -176,10 +187,12 @@ def _extract_bits(data: bytes, bit_offset: int, bit_size: int, signed: bool = Fa
     return val
 
 
-def parse_report_descriptor(desc: bytes) -> Dict[int, ReportLayout]:
-    """Parse a USB HID report descriptor and return input ReportLayouts by report ID."""
+def inspect_report_descriptor(desc: bytes) -> Tuple[Dict[int, ReportLayout], Set[Tuple[int, int]]]:
+    """Parse a USB HID report descriptor into input ReportLayouts and top-level Application Collections."""
     layouts: Dict[int, ReportLayout] = {}
     bit_offsets: Dict[int, int] = {}
+    top_level_collections: Set[Tuple[int, int]] = set()
+    collection_is_vendor: List[bool] = []
 
     global_state = {
         "usage_page": 0,
@@ -247,7 +260,22 @@ def parse_report_descriptor(desc: bytes) -> Dict[int, ReportLayout]:
             elif tag == 2:
                 usage_max = (upage, uid)
         elif item_type == 0:  # Main
-            if tag == 8:  # Input
+            if tag == 10:  # Collection
+                coll_type = _unsigned_int(raw) if raw else 0
+                if local_usages:
+                    coll_up, coll_uid = local_usages[-1]
+                elif usage_min is not None:
+                    coll_up, coll_uid = usage_min
+                else:
+                    coll_up, coll_uid = global_state["usage_page"], 0
+                if not collection_is_vendor and coll_type == 0x01:
+                    top_level_collections.add((coll_up, coll_uid))
+                in_vendor_parent = collection_is_vendor[-1] if collection_is_vendor else False
+                collection_is_vendor.append(in_vendor_parent or coll_up >= 0xFF00)
+            elif tag == 12:  # End Collection
+                if collection_is_vendor:
+                    collection_is_vendor.pop()
+            elif tag == 8:  # Input
                 flags = _unsigned_int(raw)
                 is_const = bool(flags & 0x01)
                 is_var = bool(flags & 0x02)
@@ -262,7 +290,8 @@ def parse_report_descriptor(desc: bytes) -> Dict[int, ReportLayout]:
                 start_bit = bit_offsets[report_id]
                 bit_offsets[report_id] = start_bit + report_size * report_count
 
-                if not is_const and report_size > 0 and report_count > 0:
+                in_vendor = any(collection_is_vendor) or usage_page >= 0xFF00
+                if not in_vendor and not is_const and report_size > 0 and report_count > 0:
                     layout = layouts.setdefault(report_id, ReportLayout(report_id=report_id))
 
                     resolved: List[Tuple[int, int]] = []
@@ -305,7 +334,14 @@ def parse_report_descriptor(desc: bytes) -> Dict[int, ReportLayout]:
             usage_min = None
             usage_max = None
 
-    return {rid: lay for rid, lay in layouts.items() if lay.has_inputs}
+    filtered_layouts = {rid: lay for rid, lay in layouts.items() if lay.has_inputs}
+    return filtered_layouts, top_level_collections
+
+
+def parse_report_descriptor(desc: bytes) -> Dict[int, ReportLayout]:
+    """Parse a USB HID report descriptor and return input ReportLayouts by report ID."""
+    layouts, _ = inspect_report_descriptor(desc)
+    return layouts
 
 
 class HidReportTracker:
@@ -466,33 +502,189 @@ class HidReportTracker:
         return None
 
 
-def _matching_hidraw_nodes(vid: str, pid: str) -> List[Tuple[str, Dict[int, ReportLayout]]]:
+_DJ_RECEIVER_DRIVERS = frozenset({"logitech-djreceiver"})
+_DJ_DEVICE_DRIVERS = frozenset({"logitech-hidpp-device", "logitech-djdevice"})
+
+
+def _extract_dj_slot(phys: str) -> Optional[int]:
+    m = re.search(r":([1-6])\s*$", phys or "")
+    return int(m.group(1)) if m else None
+
+
+def _uevent_vid_pid(uevent: Dict[str, str]) -> Tuple[str, str]:
+    hid_id = uevent.get("HID_ID", "")
+    parts = hid_id.split(":")
+    if len(parts) < 3:
+        return "", ""
+    return parts[1][-4:].lower(), parts[2][-4:].lower()
+
+
+def _phys_bus_prefix(phys: str) -> str:
+    if not phys:
+        return ""
+    base = re.sub(r":[1-6]\s*$", "", phys.strip())
+    return base.split("/input", 1)[0]
+
+
+@dataclass
+class _HidrawCandidate:
+    path: str
+    layouts: Dict[int, ReportLayout]
+    collections: Set[Tuple[int, int]]
+    is_direct: bool
+    is_paired_child: bool
+    dj_slot: Optional[int]
+    hid_name: str
+    hid_phys: str
+    order: int
+
+
+def _candidate_sort_key(cand: _HidrawCandidate) -> Tuple[int, int]:
+    has_mouse = (0x01, 0x02) in cand.collections or any(
+        lay.mouse_buttons or lay.hwheel is not None for lay in cand.layouts.values()
+    )
+    return (0 if has_mouse else 1, cand.order)
+
+
+def _matching_hidraw_nodes(
+    vid: str,
+    pid: str,
+    *,
+    device_name: Optional[str] = None,
+    device_index: Optional[int] = None,
+) -> List[Tuple[str, Dict[int, ReportLayout]]]:
     if not vid or not pid:
         return []
-    wanted = f"{vid.upper().zfill(8)}:{pid.upper().zfill(8)}"
-    nodes: List[Tuple[str, Dict[int, ReportLayout]]] = []
-    for sys_node in sorted(glob.glob("/sys/class/hidraw/hidraw*")):
+    vid_l = vid.strip().lower()
+    pid_l = pid.strip().lower()
+    wanted = f"{vid_l.upper().zfill(8)}:{pid_l.upper().zfill(8)}"
+    receiver_mode = is_receiver_pid(vid_l, pid_l)
+    specific_name = bool(device_name and not _is_generic_receiver_name(device_name))
+
+    candidates: List[_HidrawCandidate] = []
+    receiver_phys_prefixes: Set[str] = set()
+
+    for order, sys_node in enumerate(sorted(glob.glob("/sys/class/hidraw/hidraw*"))):
         try:
             with open(f"{sys_node}/device/uevent", "r", encoding="utf-8", errors="ignore") as f:
-                if wanted not in f.read().upper():
-                    continue
+                uevent_text = f.read()
+        except OSError as exc:
+            logger.debug("Skipping %s while discovering hidraw nodes: %s", sys_node, exc)
+            continue
+
+        uevent = _parse_uevent_lines(uevent_text)
+        driver = uevent.get("DRIVER", "").strip().lower()
+        hid_phys = uevent.get("HID_PHYS", "")
+        is_direct = wanted in uevent_text.upper()
+
+        if is_direct and receiver_mode:
+            prefix = _phys_bus_prefix(hid_phys)
+            if prefix:
+                receiver_phys_prefixes.add(prefix)
+
+        if driver in _DJ_RECEIVER_DRIVERS:
+            continue
+
+        dj_slot = _extract_dj_slot(hid_phys)
+        node_vid, _ = _uevent_vid_pid(uevent)
+        is_paired_child = (
+            receiver_mode
+            and (node_vid == LOGITECH_VID or f"{vid_l.upper().zfill(8)}:" in uevent_text.upper())
+            and (driver in _DJ_DEVICE_DRIVERS or dj_slot is not None)
+        )
+        if not is_direct and not is_paired_child:
+            continue
+
+        try:
             with open(f"{sys_node}/device/report_descriptor", "rb") as f:
                 desc = f.read()
-        except OSError:
+        except OSError as exc:
+            logger.debug("Skipping %s while reading report descriptor: %s", sys_node, exc)
             continue
-        layouts = parse_report_descriptor(desc)
-        if layouts:
-            nodes.append((f"/dev/{os.path.basename(sys_node)}", layouts))
-    return nodes
+
+        layouts, collections = inspect_report_descriptor(desc)
+        if not layouts:
+            continue
+
+        candidates.append(
+            _HidrawCandidate(
+                path=f"/dev/{os.path.basename(sys_node)}",
+                layouts=layouts,
+                collections=collections,
+                is_direct=is_direct,
+                is_paired_child=is_paired_child,
+                dj_slot=dj_slot,
+                hid_name=uevent.get("HID_NAME", ""),
+                hid_phys=hid_phys,
+                order=order,
+            )
+        )
+
+    if not candidates:
+        return []
+
+    if receiver_mode:
+        paired = [c for c in candidates if c.is_paired_child]
+        direct = [c for c in candidates if c.is_direct]
+        if receiver_phys_prefixes and paired:
+            bus_matched = [c for c in paired if _phys_bus_prefix(c.hid_phys) in receiver_phys_prefixes]
+            if bus_matched:
+                paired = bus_matched
+
+        selected: Optional[List[_HidrawCandidate]] = None
+        if device_index is not None:
+            slot_pool = [c for c in (paired + direct) if c.dj_slot == device_index]
+            if slot_pool:
+                selected = slot_pool
+
+        if selected is None and specific_name:
+            scored: List[Tuple[int, _HidrawCandidate]] = []
+            for cand in paired + direct:
+                if not cand.hid_name:
+                    continue
+                if not cand.is_paired_child and _is_generic_receiver_name(cand.hid_name):
+                    continue
+                score = _name_match_score(device_name, cand.hid_name)
+                if score > 0:
+                    scored.append((score, cand))
+            if scored:
+                best_score = max(score for score, _ in scored)
+                selected = [cand for score, cand in scored if score == best_score]
+
+        if selected is None:
+            if direct:
+                selected = direct
+            else:
+                mouse_paired = [c for c in paired if _candidate_sort_key(c)[0] == 0]
+                selected = mouse_paired or paired
+    else:
+        selected = [c for c in candidates if c.is_direct]
+        if device_index is not None:
+            slot_pool = [c for c in selected if c.dj_slot == device_index]
+            if slot_pool:
+                selected = slot_pool
+
+    selected.sort(key=_candidate_sort_key)
+    return [(cand.path, cand.layouts) for cand in selected]
 
 
 class HidInputMonitor:
     """Single-shot read-only hidraw listener for identifying mouse button presses."""
 
-    def __init__(self, vid: str, pid: str, on_input: Callable[[str, str], None]):
+    def __init__(
+        self,
+        vid: str,
+        pid: str,
+        on_input: Callable[[str, str], None],
+        *,
+        device_name: Optional[str] = None,
+        device_index: Optional[int] = None,
+    ):
         self._vid = vid.lower()
         self._pid = pid.lower()
         self._on_input = on_input
+        self._device_name = device_name
+        self._device_index = device_index
         self._thread: Optional[threading.Thread] = None
         self._stop_w: Optional[int] = None
         self._pipe_lock = threading.Lock()
@@ -505,7 +697,12 @@ class HidInputMonitor:
     def start(self) -> bool:
         if self.is_running:
             return True
-        candidates = _matching_hidraw_nodes(self._vid, self._pid)
+        candidates = _matching_hidraw_nodes(
+            self._vid,
+            self._pid,
+            device_name=self._device_name,
+            device_index=self._device_index,
+        )
         if not candidates:
             return False
 
@@ -514,7 +711,15 @@ class HidInputMonitor:
             try:
                 fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
                 opened.append((fd, HidReportTracker(layouts)))
-            except OSError:
+            except PermissionError as exc:
+                logger.warning(
+                    "Permission denied opening %s for raw HID input monitoring (check udev rules): %s",
+                    path,
+                    exc,
+                )
+                continue
+            except OSError as exc:
+                logger.debug("Could not open %s for raw HID input monitoring: %s", path, exc)
                 continue
 
         if not opened:
@@ -522,12 +727,13 @@ class HidInputMonitor:
 
         try:
             stop_r, stop_w = os.pipe()
-        except OSError:
+        except OSError as exc:
+            logger.warning("Failed to create pipe for HidInputMonitor: %s", exc)
             for fd, _ in opened:
                 try:
                     os.close(fd)
-                except OSError:
-                    pass
+                except OSError as close_exc:
+                    logger.debug("Failed closing hidraw fd after pipe error: %s", close_exc)
             return False
 
         self._stop_w = stop_w
@@ -548,12 +754,12 @@ class HidInputMonitor:
         if stop_w is not None:
             try:
                 os.write(stop_w, b"\x00")
-            except OSError:
-                pass
+            except OSError as exc:
+                logger.debug("Error writing stop signal to HidInputMonitor pipe: %s", exc)
             try:
                 os.close(stop_w)
-            except OSError:
-                pass
+            except OSError as exc:
+                logger.debug("Error closing HidInputMonitor stop pipe write fd: %s", exc)
 
     def _run(self, opened: List[Tuple[int, HidReportTracker]], stop_r: int):
         fd_map = {fd: tracker for fd, tracker in opened}
@@ -580,7 +786,8 @@ class HidInputMonitor:
                         data = os.read(fd, 64)
                     except BlockingIOError:
                         continue
-                    except OSError:
+                    except OSError as exc:
+                        logger.debug("Error reading hidraw fd %d: %s", fd, exc)
                         continue
                     if not data:
                         continue
@@ -602,24 +809,24 @@ class HidInputMonitor:
                         break
                 if emitted:
                     break
-        except OSError:
-            pass
+        except OSError as exc:
+            logger.debug("HidInputMonitor loop exited on OSError: %s", exc)
         finally:
             self._running = False
             for fd in fd_map:
                 try:
                     os.close(fd)
-                except OSError:
-                    pass
+                except OSError as exc:
+                    logger.debug("Error closing hidraw fd %d: %s", fd, exc)
             try:
                 os.close(stop_r)
-            except OSError:
-                pass
+            except OSError as exc:
+                logger.debug("Error closing HidInputMonitor stop read fd: %s", exc)
             with self._pipe_lock:
                 stop_w = self._stop_w
                 self._stop_w = None
             if stop_w is not None:
                 try:
                     os.close(stop_w)
-                except OSError:
-                    pass
+                except OSError as exc:
+                    logger.debug("Error closing HidInputMonitor stop write fd: %s", exc)

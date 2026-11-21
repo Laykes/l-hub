@@ -1,6 +1,6 @@
 import json
+import logging
 import os
-import sys
 import time
 from pathlib import Path
 from typing import Optional
@@ -8,6 +8,8 @@ from typing import Optional
 from PySide6.QtCore import QDir, QLockFile, QObject, QStandardPaths, Qt, Signal
 from PySide6.QtGui import QGuiApplication, QWindow
 from PySide6.QtNetwork import QLocalServer, QLocalSocket
+
+logger = logging.getLogger(__name__)
 
 DEFAULT_APP_ID = "io.github.lhub.LHub"
 MAX_MESSAGE_BYTES = 4096
@@ -92,9 +94,10 @@ class SingleInstanceGuard(QObject):
         server = QLocalServer(self)
         server.setSocketOptions(QLocalServer.SocketOption.UserAccessOption)
         if not server.listen(self._socket_path):
-            print(
-                f"Warning: Could not listen on instance socket {self._socket_path}: {server.errorString()}",
-                file=sys.stderr,
+            logger.warning(
+                "Could not listen on instance socket %s: %s",
+                self._socket_path,
+                server.errorString(),
             )
             server.deleteLater()
             return True
@@ -164,8 +167,8 @@ class SingleInstanceGuard(QObject):
                 data = json.loads(line.decode("utf-8"))
                 if isinstance(data, dict) and isinstance(data.get("token"), str):
                     token = data["token"]
-            except (UnicodeDecodeError, json.JSONDecodeError):
-                pass
+            except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+                logger.debug("Ignoring invalid activation message: %s", exc)
 
         self.activationRequested.emit(token)
 

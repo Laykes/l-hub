@@ -11,6 +11,7 @@ QQC2.ApplicationWindow {
     property string selectedDeviceId: ""
     property string toastMessage: ""
     property bool toastWarning: false
+    property bool healthBannerExpanded: true
 
     readonly property var selectedDevice: {
         var devs = deviceManager.devices || []
@@ -28,7 +29,7 @@ QQC2.ApplicationWindow {
     height: 700
     minimumWidth: 740
     minimumHeight: 520
-    visible: true
+    visible: typeof startMinimized === "undefined" ? true : !startMinimized
     color: theme.bgWindow
 
     function showToast(msg, isWarning) {
@@ -41,9 +42,12 @@ QQC2.ApplicationWindow {
     function deviceBatteryColor(dev) {
         if (!dev) return theme.textSecondary
         var pct = dev.batteryPercentage
+        var threshold = (typeof deviceManager !== "undefined" && deviceManager && deviceManager.lowBatteryThreshold !== undefined)
+                        ? deviceManager.lowBatteryThreshold
+                        : 20
         if (dev.isCharging && pct < 0) return theme.positive
         if (pct > 50) return theme.positive
-        if (pct > 20) return theme.warning
+        if (pct > threshold) return theme.warning
         return theme.danger
     }
 
@@ -99,9 +103,9 @@ QQC2.ApplicationWindow {
 
                     RowLayout {
                         anchors.fill: parent
-                        anchors.leftMargin: 16
-                        anchors.rightMargin: 14
-                        spacing: 12
+                        anchors.leftMargin: 14
+                        anchors.rightMargin: 12
+                        spacing: 10
 
                         Image {
                             source: Qt.resolvedUrl("../assets/io.github.lhub.LHub.svg")
@@ -121,6 +125,8 @@ QQC2.ApplicationWindow {
                                 color: theme.textPrimary
                                 font.pixelSize: 16
                                 font.weight: Font.Bold
+                                elide: Text.ElideRight
+                                Layout.fillWidth: true
                             }
 
                             Text {
@@ -128,19 +134,35 @@ QQC2.ApplicationWindow {
                                 color: theme.textMuted
                                 font.pixelSize: 11
                                 font.weight: Font.Medium
+                                elide: Text.ElideRight
+                                Layout.fillWidth: true
                             }
                         }
 
-                        UiButton {
-                            variant: "subtle"
-                            compact: true
-                            iconName: "view-refresh-symbolic"
-                            implicitWidth: 32
-                            implicitHeight: 32
-                            toolTipText: "Refresh devices"
-                            onClicked: {
-                                deviceManager.refresh_devices()
-                                root.showToast("Scanning for devices...")
+                        RowLayout {
+                            spacing: 4
+
+                            UiButton {
+                                variant: "subtle"
+                                compact: true
+                                iconName: "view-refresh-symbolic"
+                                implicitWidth: 32
+                                implicitHeight: 32
+                                toolTipText: "Refresh devices"
+                                onClicked: {
+                                    deviceManager.refresh_devices()
+                                    root.showToast("Scanning for devices...")
+                                }
+                            }
+
+                            UiButton {
+                                variant: "subtle"
+                                compact: true
+                                iconName: "preferences-system-symbolic"
+                                implicitWidth: 32
+                                implicitHeight: 32
+                                toolTipText: "Application settings"
+                                onClicked: settingsDialog.open()
                             }
                         }
                     }
@@ -406,38 +428,191 @@ QQC2.ApplicationWindow {
                     y: 24
                     spacing: 16
 
-                    // Missing Backends Warning Banners
-                    Repeater {
-                        model: deviceManager.missingBackends
+                    // System Health Diagnostic Banner (only shown when warnings/errors exist)
+                    Rectangle {
+                        id: healthBanner
+                        readonly property var issues: (deviceManager && deviceManager.healthIssues) ? deviceManager.healthIssues : []
+                        readonly property bool hasError: {
+                            for (var i = 0; i < issues.length; i++) {
+                                if (issues[i].severity === "error") return true
+                            }
+                            return false
+                        }
 
-                        Rectangle {
-                            Layout.fillWidth: true
-                            radius: theme.radiusMd
-                            color: theme.warningSoft
-                            border.color: theme.warning
-                            border.width: 1
-                            implicitHeight: warnRow.implicitHeight + 22
+                        visible: Boolean(deviceManager && deviceManager.hasHealthIssues)
+                        Layout.fillWidth: true
+                        radius: theme.radiusMd
+                        color: hasError ? theme.dangerSoft : theme.warningSoft
+                        border.color: hasError ? theme.dangerBorder : theme.warning
+                        border.width: 1
+                        implicitHeight: healthBannerCol.implicitHeight + 24
+
+                        ColumnLayout {
+                            id: healthBannerCol
+                            anchors.left: parent.left
+                            anchors.right: parent.right
+                            anchors.top: parent.top
+                            anchors.margins: 12
+                            spacing: 10
 
                             RowLayout {
-                                id: warnRow
-                                anchors.fill: parent
-                                anchors.margins: 11
+                                Layout.fillWidth: true
                                 spacing: 10
 
                                 Kirigami.Icon {
-                                    source: "dialog-warning"
+                                    source: healthBanner.hasError ? "dialog-error" : "dialog-warning"
                                     Layout.preferredWidth: 18
                                     Layout.preferredHeight: 18
                                     isMask: true
-                                    color: theme.warning
+                                    color: healthBanner.hasError ? theme.danger : theme.warning
                                 }
 
                                 Text {
-                                    text: modelData
+                                    text: {
+                                        var count = healthBanner.issues.length
+                                        return count === 1
+                                            ? "System Health: 1 issue detected"
+                                            : ("System Health: " + count + " issues detected")
+                                    }
                                     color: theme.textPrimary
                                     font.pixelSize: 13
-                                    wrapMode: Text.WordWrap
+                                    font.weight: Font.DemiBold
                                     Layout.fillWidth: true
+                                    elide: Text.ElideRight
+                                }
+
+                                UiButton {
+                                    variant: "subtle"
+                                    compact: true
+                                    iconName: "view-refresh-symbolic"
+                                    toolTipText: "Re-check system health"
+                                    onClicked: {
+                                        deviceManager.refresh_devices()
+                                        root.showToast("Re-checking system health...")
+                                    }
+                                }
+
+                                UiButton {
+                                    variant: "subtle"
+                                    compact: true
+                                    text: root.healthBannerExpanded ? "Hide" : "Details"
+                                    iconName: root.healthBannerExpanded ? "go-up-symbolic" : "go-down-symbolic"
+                                    onClicked: root.healthBannerExpanded = !root.healthBannerExpanded
+                                }
+                            }
+
+                            ColumnLayout {
+                                visible: root.healthBannerExpanded
+                                Layout.fillWidth: true
+                                spacing: 8
+
+                                Repeater {
+                                    model: healthBanner.issues
+
+                                    Rectangle {
+                                        Layout.fillWidth: true
+                                        radius: theme.radiusSm
+                                        color: theme.bgSurface
+                                        border.color: modelData.severity === "error" ? theme.dangerBorder : theme.borderSubtle
+                                        border.width: 1
+                                        implicitHeight: issueCol.implicitHeight + 20
+
+                                        ColumnLayout {
+                                            id: issueCol
+                                            anchors.left: parent.left
+                                            anchors.right: parent.right
+                                            anchors.top: parent.top
+                                            anchors.margins: 10
+                                            spacing: 6
+
+                                            RowLayout {
+                                                Layout.fillWidth: true
+                                                spacing: 8
+
+                                                Rectangle {
+                                                    radius: theme.radiusXs
+                                                    color: modelData.severity === "error" ? theme.dangerSoft : theme.warningSoft
+                                                    border.color: modelData.severity === "error" ? theme.dangerBorder : theme.warning
+                                                    border.width: 1
+                                                    implicitWidth: badgeText.implicitWidth + 12
+                                                    implicitHeight: badgeText.implicitHeight + 6
+
+                                                    Text {
+                                                        id: badgeText
+                                                        anchors.centerIn: parent
+                                                        text: modelData.severity === "error" ? "ERROR" : "WARNING"
+                                                        color: modelData.severity === "error" ? theme.danger : theme.warning
+                                                        font.pixelSize: 10
+                                                        font.weight: Font.Bold
+                                                        font.letterSpacing: 0.6
+                                                    }
+                                                }
+
+                                                Text {
+                                                    text: modelData.title || ""
+                                                    color: theme.textPrimary
+                                                    font.pixelSize: 13
+                                                    font.weight: Font.DemiBold
+                                                    wrapMode: Text.WordWrap
+                                                    Layout.fillWidth: true
+                                                }
+                                            }
+
+                                            Text {
+                                                visible: Boolean(modelData.description)
+                                                text: modelData.description || ""
+                                                color: theme.textSecondary
+                                                font.pixelSize: 12
+                                                wrapMode: Text.WordWrap
+                                                Layout.fillWidth: true
+                                            }
+
+                                            Rectangle {
+                                                visible: Boolean(modelData.fixHint)
+                                                Layout.fillWidth: true
+                                                radius: theme.radiusXs
+                                                color: theme.bgControl
+                                                border.color: theme.borderSubtle
+                                                border.width: 1
+                                                implicitHeight: Math.max(fixHintRow.implicitHeight + 12, 40)
+
+                                                RowLayout {
+                                                    id: fixHintRow
+                                                    anchors.left: parent.left
+                                                    anchors.right: parent.right
+                                                    anchors.verticalCenter: parent.verticalCenter
+                                                    anchors.leftMargin: 10
+                                                    anchors.rightMargin: 6
+                                                    spacing: 8
+
+                                                    TextEdit {
+                                                        text: modelData.fixHint || ""
+                                                        readOnly: true
+                                                        selectByMouse: true
+                                                        wrapMode: TextEdit.Wrap
+                                                        color: theme.textPrimary
+                                                        font.family: "monospace"
+                                                        font.pixelSize: 12
+                                                        Layout.fillWidth: true
+                                                        Layout.alignment: Qt.AlignVCenter
+                                                    }
+
+                                                    UiButton {
+                                                        variant: "default"
+                                                        compact: true
+                                                        iconName: "edit-copy-symbolic"
+                                                        text: "Copy"
+                                                        toolTipText: "Copy command to clipboard"
+                                                        onClicked: {
+                                                            if (deviceManager.copyToClipboard(modelData.fixHint)) {
+                                                                root.showToast("Fix command copied to clipboard.")
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -622,6 +797,12 @@ QQC2.ApplicationWindow {
             deviceManager.remapButton(devId, btnIdx, action)
             root.showToast("Button remapped.")
         }
+    }
+
+    SettingsDialog {
+        id: settingsDialog
+
+        onSettingsSaved: root.showToast("Settings saved.")
     }
 
     // Create New Profile Modal

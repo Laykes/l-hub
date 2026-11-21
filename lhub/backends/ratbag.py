@@ -1,10 +1,107 @@
+"""Ratbagd D-Bus backend for gaming mice and keyboards (``org.freedesktop.ratbag1``)."""
+
+from enum import IntEnum
+import logging
 import re
-import shutil
-import subprocess
+import threading
 import time
-from typing import List, Optional, Dict, Tuple
-from .base import BaseBackend, Device, DeviceType, Capability, DpiInfo, ButtonMapping
+from typing import Any, Callable, Dict, List, Optional, Tuple
+
 from . import hidpp
+from .base import BaseBackend, ButtonMapping, Capability, Device, DeviceType, DpiInfo
+from .dbus_client import (
+    DBUS_IFACE,
+    DBUS_PATH,
+    DBUS_PROPERTIES_IFACE,
+    DBUS_SERVICE,
+    DBusCallError,
+    DBusError,
+    DBusSignalEvent,
+    SystemDBusClient,
+    get_system_dbus_client,
+    unwrap_variant,
+)
+from .evdev_codes import evcode_to_key_name, key_name_to_evcode
+from ..device_layouts import (
+    find_device_layout,
+    get_button_metadata as _get_button_metadata,
+    get_factory_reset_defaults,
+)
+
+logger = logging.getLogger(__name__)
+
+RATBAG_SERVICE = "org.freedesktop.ratbag1"
+RATBAG_MANAGER_PATH = "/org/freedesktop/ratbag1"
+RATBAG_MANAGER_IFACE = "org.freedesktop.ratbag1.Manager"
+RATBAG_DEVICE_IFACE = "org.freedesktop.ratbag1.Device"
+RATBAG_PROFILE_IFACE = "org.freedesktop.ratbag1.Profile"
+RATBAG_RESOLUTION_IFACE = "org.freedesktop.ratbag1.Resolution"
+RATBAG_BUTTON_IFACE = "org.freedesktop.ratbag1.Button"
+RATBAG_API_VERSION = 2
+
+
+class RatbagDeviceType(IntEnum):
+    """DeviceType values exposed on ``org.freedesktop.ratbag1.Device``."""
+
+    UNSPECIFIED = 0
+    OTHER = 1
+    MOUSE = 2
+    KEYBOARD = 3
+
+
+class RatbagActionType(IntEnum):
+    """ActionType values exposed on ``org.freedesktop.ratbag1.Button``."""
+
+    NONE = 0
+    BUTTON = 1
+    SPECIAL = 2
+    KEY = 3
+    MACRO = 4
+
+
+class RatbagActionSpecial(IntEnum):
+    """Special button action codes defined by libratbag."""
+
+    INVALID = -1
+    UNKNOWN = 1 << 30
+    DOUBLECLICK = (1 << 30) + 1
+    WHEEL_LEFT = (1 << 30) + 2
+    WHEEL_RIGHT = (1 << 30) + 3
+    WHEEL_UP = (1 << 30) + 4
+    WHEEL_DOWN = (1 << 30) + 5
+    RATCHET_MODE_SWITCH = (1 << 30) + 6
+    RESOLUTION_CYCLE_UP = (1 << 30) + 7
+    RESOLUTION_CYCLE_DOWN = (1 << 30) + 8
+    RESOLUTION_UP = (1 << 30) + 9
+    RESOLUTION_DOWN = (1 << 30) + 10
+    RESOLUTION_ALTERNATE = (1 << 30) + 11
+    RESOLUTION_DEFAULT = (1 << 30) + 12
+    PROFILE_CYCLE_UP = (1 << 30) + 13
+    PROFILE_CYCLE_DOWN = (1 << 30) + 14
+    PROFILE_UP = (1 << 30) + 15
+    PROFILE_DOWN = (1 << 30) + 16
+    SECOND_MODE = (1 << 30) + 17
+    BATTERY_LEVEL = (1 << 30) + 18
+
+
+class RatbagMacroEvent(IntEnum):
+    """Macro event types in ``org.freedesktop.ratbag1.Button.Mapping`` ``a(uu)``."""
+
+    NONE = 0
+    KEY_PRESS = 1
+    KEY_RELEASE = 2
+    WAIT = 3
+
+
+SPECIAL_TO_NAME: Dict[int, str] = {
+    int(item): item.name.lower().replace("_", "-")
+    for item in RatbagActionSpecial
+}
+NAME_TO_SPECIAL: Dict[str, int] = {
+    name: code
+    for code, name in SPECIAL_TO_NAME.items()
+    if code not in (int(RatbagActionSpecial.INVALID), int(RatbagActionSpecial.UNKNOWN))
+}
 
 
 ACTION_DISPLAY_NAMES: Dict[str, str] = {
@@ -259,64 +356,8 @@ def actions_match(configured_action: str, detected_action: str, relaxed_modifier
 
 
 def get_button_metadata(dev_name: str, vid: str, pid: str, b_idx: int, act_val: str, total_buttons: int) -> Dict[str, str]:
-    name_lower = dev_name.lower()
-    is_g502 = "g502" in name_lower or (vid == "046d" and pid in ("c099", "c092", "c07d", "c332", "c08b"))
-
-    if is_g502:
-        g502_meta = {
-            0: {"name": "Left Click (LMB)", "label": "Left Click", "location": "Primary Left", "group": "main", "default": "button 1"},
-            1: {"name": "Right Click (RMB)", "label": "Right Click", "location": "Primary Right", "group": "main", "default": "button 2"},
-            2: {"name": "Middle Click (Wheel)", "label": "Wheel Click", "location": "Scroll Wheel", "group": "wheel", "default": "button 3"},
-            3: {"name": "Side Back (G4)", "label": "Back", "location": "Thumb Rest (Rear)", "group": "side", "default": "button 4"},
-            4: {"name": "DPI Shift / Sniper (G6)", "label": "Sniper / Shift", "location": "Thumb Tip (Front)", "group": "side", "default": "special resolution-alternate"},
-            5: {"name": "Side Forward (G5)", "label": "Forward", "location": "Thumb Rest (Front)", "group": "side", "default": "button 5"},
-            6: {"name": "Wheel Tilt Left", "label": "Tilt Left", "location": "Scroll Wheel", "group": "wheel", "default": "special wheel-left"},
-            7: {"name": "Wheel Tilt Right", "label": "Tilt Right", "location": "Scroll Wheel", "group": "wheel", "default": "special wheel-right"},
-            8: {"name": "Profile Switch (G9)", "label": "Profile Switch", "location": "Behind Wheel", "group": "dpi", "default": "special profile-cycle-up"},
-            9: {"name": "DPI Up (G8)", "label": "DPI Up", "location": "Left of LMB", "group": "dpi", "default": "special resolution-up"},
-            10: {"name": "DPI Down (G7)", "label": "DPI Down", "location": "Left of LMB", "group": "dpi", "default": "special resolution-down"},
-        }
-        if b_idx in g502_meta:
-            return g502_meta[b_idx]
-
-    if b_idx == 0:
-        return {"name": "Left Click", "label": "Left Click", "location": "Primary Left", "group": "main", "default": "button 1"}
-    if b_idx == 1:
-        return {"name": "Right Click", "label": "Right Click", "location": "Primary Right", "group": "main", "default": "button 2"}
-    if b_idx == 2:
-        return {"name": "Middle Click", "label": "Wheel Click", "location": "Scroll Wheel", "group": "wheel", "default": "button 3"}
-    if b_idx == 3:
-        return {"name": "Side Back (Button 4)", "label": "Back", "location": "Side Thumb", "group": "side", "default": "button 4"}
-    if b_idx == 4 and total_buttons <= 6:
-        return {"name": "Side Forward (Button 5)", "label": "Forward", "location": "Side Thumb", "group": "side", "default": "button 5"}
-
-    act_lower = act_val.lower()
-    if "wheel-left" in act_lower:
-        return {"name": "Wheel Tilt Left", "label": "Tilt Left", "location": "Scroll Wheel", "group": "wheel", "default": "special wheel-left"}
-    if "wheel-right" in act_lower:
-        return {"name": "Wheel Tilt Right", "label": "Tilt Right", "location": "Scroll Wheel", "group": "wheel", "default": "special wheel-right"}
-    if "resolution-alternate" in act_lower or "sniper" in act_lower:
-        return {"name": "DPI Shift / Sniper", "label": "Sniper", "location": "Thumb Rest", "group": "side", "default": "special resolution-alternate"}
-    if "resolution-up" in act_lower:
-        return {"name": "DPI Up", "label": "DPI Up", "location": "Top Controls", "group": "dpi", "default": "special resolution-up"}
-    if "resolution-down" in act_lower:
-        return {"name": "DPI Down", "label": "DPI Down", "location": "Top Controls", "group": "dpi", "default": "special resolution-down"}
-    if "resolution-cycle" in act_lower:
-        return {"name": "Cycle DPI", "label": "Cycle DPI", "location": "Top Controls", "group": "dpi", "default": "special resolution-cycle-up"}
-    if "profile-cycle" in act_lower:
-        return {"name": "Cycle Profile", "label": "Cycle Profile", "location": "Top Controls", "group": "dpi", "default": "special profile-cycle-up"}
-    if act_lower == "button 4":
-        return {"name": "Side Back (Button 4)", "label": "Back", "location": "Side Thumb", "group": "side", "default": "button 4"}
-    if act_lower == "button 5":
-        return {"name": "Side Forward (Button 5)", "label": "Forward", "location": "Side Thumb", "group": "side", "default": "button 5"}
-
-    return {
-        "name": f"Button {b_idx + 1}",
-        "label": f"Button {b_idx + 1}",
-        "location": "Mouse",
-        "group": "main" if b_idx < 3 else ("side" if b_idx < 6 else "dpi"),
-        "default": f"button {b_idx + 1}",
-    }
+    """Return button metadata from matching device layout JSON or generic fallback."""
+    return _get_button_metadata(dev_name, vid, pid, b_idx, act_val, total_buttons)
 
 
 def parse_button_action(raw_val: str) -> Tuple[str, str]:
@@ -333,7 +374,7 @@ def parse_button_action(raw_val: str) -> Tuple[str, str]:
         action = f"key {k}"
     elif val == "none":
         action = "disabled"
-    elif val == "UNKNOWN":
+    elif val.lower() == "unknown":
         action = "unknown"
     elif val in [
         "resolution-alternate",
@@ -345,7 +386,7 @@ def parse_button_action(raw_val: str) -> Tuple[str, str]:
         "wheel-right",
         "profile-cycle-up",
         "second-mode",
-    ]:
+    ] or val in NAME_TO_SPECIAL:
         action = f"special {val}"
     else:
         action = val
@@ -359,44 +400,287 @@ def parse_button_action(raw_val: str) -> Tuple[str, str]:
     return action, disp
 
 
+def unpack_dbus_resolution(raw_res: Any) -> Tuple[int, ...]:
+    """Unpack ``org.freedesktop.ratbag1.Resolution.Resolution`` into a 1- or 2-int tuple."""
+    val = unwrap_variant(raw_res, recursive=True)
+    if isinstance(val, int):
+        return (int(val),)
+    if isinstance(val, (list, tuple)):
+        return tuple(int(x) for x in val if isinstance(x, (int, float)))
+    return ()
+
+
+def decode_dbus_button_mapping(mapping: Any) -> Tuple[str, str]:
+    """Decode ``org.freedesktop.ratbag1.Button.Mapping`` ``(uv)`` into ``(action, display)``."""
+    unwrapped = unwrap_variant(mapping, recursive=False)
+    if not isinstance(unwrapped, (list, tuple)) or len(unwrapped) != 2:
+        return parse_button_action("UNKNOWN")
+
+    action_type_raw, payload_raw = unwrapped
+    try:
+        action_type = int(action_type_raw)
+    except (TypeError, ValueError):
+        return parse_button_action("UNKNOWN")
+
+    payload = unwrap_variant(payload_raw, recursive=True)
+
+    if action_type == int(RatbagActionType.NONE):
+        return parse_button_action("none")
+
+    if action_type == int(RatbagActionType.BUTTON):
+        try:
+            btn_num = int(payload)
+        except (TypeError, ValueError):
+            return parse_button_action("UNKNOWN")
+        return parse_button_action(f"button {btn_num}")
+
+    if action_type == int(RatbagActionType.SPECIAL):
+        try:
+            spec_code = int(payload)
+        except (TypeError, ValueError):
+            return parse_button_action("UNKNOWN")
+        spec_name = SPECIAL_TO_NAME.get(spec_code)
+        if spec_name and spec_name not in ("unknown", "invalid"):
+            return parse_button_action(spec_name)
+        return parse_button_action("UNKNOWN")
+
+    if action_type == int(RatbagActionType.KEY):
+        try:
+            key_code = int(payload)
+        except (TypeError, ValueError):
+            return parse_button_action("UNKNOWN")
+        return parse_button_action(f"key {evcode_to_key_name(key_code)}")
+
+    if action_type == int(RatbagActionType.MACRO):
+        if not isinstance(payload, (list, tuple)) or not payload:
+            return "macro", "Custom Macro"
+        events: List[Tuple[int, int]] = []
+        for entry in payload:
+            if isinstance(entry, (list, tuple)) and len(entry) == 2:
+                try:
+                    events.append((int(entry[0]), int(entry[1])))
+                except (TypeError, ValueError):
+                    continue
+        if not events:
+            return "macro", "Custom Macro"
+
+        tokens: List[str] = []
+        idx = 0
+        while idx < len(events):
+            ev_type, ev_val = events[idx]
+            if ev_type == int(RatbagMacroEvent.WAIT):
+                tokens.append(f"{ev_val}ms")
+            elif ev_type == int(RatbagMacroEvent.KEY_PRESS):
+                key_name = evcode_to_key_name(ev_val)
+                if (
+                    idx + 1 < len(events)
+                    and events[idx + 1][0] == int(RatbagMacroEvent.KEY_RELEASE)
+                    and events[idx + 1][1] == ev_val
+                ):
+                    tokens.append(f"↕{key_name}")
+                    idx += 1
+                else:
+                    tokens.append(f"↓{key_name}")
+            elif ev_type == int(RatbagMacroEvent.KEY_RELEASE):
+                tokens.append(f"↑{evcode_to_key_name(ev_val)}")
+            idx += 1
+        return parse_macro(" ".join(tokens))
+
+    return parse_button_action("UNKNOWN")
+
+
+def encode_dbus_button_mapping(action: str) -> Tuple[int, Tuple[str, Any]]:
+    """Encode an action string (e.g. ``button 1``, ``key KEY_SPACE``, ``macro ...``) into ``(uv)``."""
+    raw = str(action or "").strip()
+    if raw.startswith("'") and raw.endswith("'") and len(raw) >= 2:
+        raw = raw[1:-1].strip()
+
+    lowered = raw.lower()
+    if not raw or lowered in ("unknown", "standard / unbekannt", "default / unknown"):
+        raise ValueError(f"Cannot encode unknown/empty action: {action!r}")
+
+    if lowered in ("none", "disabled"):
+        return (int(RatbagActionType.NONE), ("u", 0))
+
+    if lowered.startswith("button "):
+        btn_part = raw.split(None, 1)[1].strip()
+        try:
+            btn_num = int(btn_part)
+        except ValueError as exc:
+            raise ValueError(f"Invalid mouse button index in action {action!r}") from exc
+        if btn_num <= 0:
+            raise ValueError(f"Invalid mouse button number {btn_num} in action {action!r}")
+        return (int(RatbagActionType.BUTTON), ("u", btn_num))
+
+    if lowered.startswith("special ") or lowered in NAME_TO_SPECIAL:
+        spec_name = raw.split(None, 1)[1].strip().lower() if lowered.startswith("special ") else lowered
+        if spec_name not in NAME_TO_SPECIAL or spec_name == "unknown":
+            raise ValueError(f"Unknown ratbag special action: {action!r}")
+        return (int(RatbagActionType.SPECIAL), ("u", int(NAME_TO_SPECIAL[spec_name])))
+
+    if lowered.startswith("key "):
+        key_part = raw.split(None, 1)[1].strip().strip("'\"")
+        code = key_name_to_evcode(key_part)
+        return (int(RatbagActionType.KEY), ("u", int(code)))
+
+    if lowered.startswith("macro ") or lowered.startswith("macro'"):
+        body = raw[5:].strip()
+        if body.startswith("'") and body.endswith("'") and len(body) >= 2:
+            body = body[1:-1].strip()
+        tokens = _normalize_macro_tokens(body)
+        events: List[Tuple[int, int]] = []
+
+        def _append_event(ev_type: int, ev_val: int) -> None:
+            pair = (ev_type, ev_val)
+            if not events or events[-1] != pair:
+                events.append(pair)
+
+        for tok in tokens:
+            wait_match = re.fullmatch(r"[tT](\d+)(?:ms)?", tok)
+            if wait_match:
+                _append_event(int(RatbagMacroEvent.WAIT), int(wait_match.group(1)))
+                continue
+            if tok.startswith("+"):
+                _append_event(int(RatbagMacroEvent.KEY_PRESS), key_name_to_evcode(tok[1:]))
+            elif tok.startswith("-"):
+                _append_event(int(RatbagMacroEvent.KEY_RELEASE), key_name_to_evcode(tok[1:]))
+            else:
+                code = key_name_to_evcode(tok)
+                _append_event(int(RatbagMacroEvent.KEY_PRESS), code)
+                _append_event(int(RatbagMacroEvent.KEY_RELEASE), code)
+
+        if not events:
+            raise ValueError(f"Empty macro action: {action!r}")
+        return (int(RatbagActionType.MACRO), ("a(uu)", events))
+
+    raise ValueError(f"Unsupported ratbag button action: {action!r}")
+
+
+def _parse_model_usb_ids(model_str: str) -> Tuple[str, str]:
+    parts = [p.strip().lower() for p in str(model_str or "").split(":")]
+    if len(parts) >= 3 and parts[0] in ("usb", "bluetooth"):
+        return parts[1], parts[2]
+    return "", ""
+
 
 class RatbagBackend(BaseBackend):
-    """Backend for gaming mice and keyboards using libratbag (ratbagd)."""
+    """Backend for gaming mice and keyboards using libratbag (``ratbagd``) over D-Bus."""
 
-    def __init__(self):
+    def __init__(self, dbus_client: Optional[SystemDBusClient] = None):
         super().__init__("ratbagd")
-        self._ctl = shutil.which("ratbagctl")
+        self._dbus = dbus_client or get_system_dbus_client()
+        self._topology_lock = threading.Lock()
+        self._device_paths: Dict[str, str] = {}
+        self._profile_paths: Dict[str, Dict[int, str]] = {}
+        self._resolution_paths: Dict[str, Dict[int, Dict[int, str]]] = {}
+        self._resolution_is_xy: Dict[str, Dict[int, Dict[int, bool]]] = {}
+        self._button_paths: Dict[str, Dict[int, Dict[int, str]]] = {}
         self._resolution_maps: Dict[str, Dict[int, int]] = {}
         self._usb_ids: Dict[str, Tuple[str, str]] = {}
+        self._device_names: Dict[str, str] = {}
         self._active_profiles: Dict[str, int] = {}
+        self._subscription_ids: List[int] = []
+        self._activation_failed: bool = False
+
+    def _hidpp_kwargs(self, device_id: str) -> Dict[str, Any]:
+        with self._topology_lock:
+            dev_name = self._device_names.get(device_id)
+        if dev_name:
+            return {"device_name": dev_name, "device_key": device_id}
+        return {}
 
     def _resolve_active_profile(self, device_id: str) -> Tuple[Optional[int], Optional[int]]:
         """Return (0-based ratbag profile index, 16-bit HID++ profile ID)."""
-        usb_id = self._usb_ids.get(device_id)
+        with self._topology_lock:
+            usb_id = self._usb_ids.get(device_id)
+            active_profile = self._active_profiles.get(device_id)
         if usb_id:
-            hw_id = hidpp.get_onboard_profile(*usb_id)
+            hw_id = hidpp.get_onboard_profile(*usb_id, **self._hidpp_kwargs(device_id))
             hw_idx = hidpp.onboard_profile_index(hw_id)
             if hw_idx is not None:
-                self._active_profiles[device_id] = hw_idx
+                with self._topology_lock:
+                    self._active_profiles[device_id] = hw_idx
                 return hw_idx, hw_id
-        return self._active_profiles.get(device_id), None
+        return active_profile, None
 
     def _finalize_hidpp_commit(self, device_id: str, hidpp_profile_id: Optional[int]) -> None:
-        usb_id = self._usb_ids.get(device_id)
+        with self._topology_lock:
+            usb_id = self._usb_ids.get(device_id)
         if not usb_id or hidpp_profile_id is None:
             return
         # ratbagd commits asynchronously over hidraw; wait before sending HID++ traffic
         # so we don't collide with the flash write, then reload the active profile into RAM.
         time.sleep(1.5)
-        hidpp.set_onboard_profile(*usb_id, hidpp_profile_id)
+        hidpp.set_onboard_profile(*usb_id, hidpp_profile_id, **self._hidpp_kwargs(device_id))
+
+    def _ensure_ratbagd_running(self) -> bool:
+        if not self._dbus.is_bus_available():
+            return False
+        if self._dbus.has_name_owner(RATBAG_SERVICE):
+            self._activation_failed = False
+            return True
+        if self._activation_failed or not self._dbus.is_service_activatable(RATBAG_SERVICE):
+            return False
+        try:
+            self._dbus.start_service_by_name(RATBAG_SERVICE)
+            self._activation_failed = False
+            return True
+        except DBusError as exc:
+            logger.debug("On-demand D-Bus activation of %s failed: %s", RATBAG_SERVICE, exc)
+            self._activation_failed = True
+            return False
 
     def is_available(self) -> bool:
-        return self._ctl is not None
+        return self._ensure_ratbagd_running()
 
     def get_missing_reason(self) -> str:
         if not self.is_available():
-            return "libratbag is not installed (sudo pacman -S libratbag && sudo systemctl enable --now ratbagd)"
+            return "libratbag / ratbagd is unavailable (sudo pacman -S libratbag && sudo systemctl enable --now ratbagd)"
         return ""
+
+    @property
+    def supports_hotplug(self) -> bool:
+        return True
+
+    def start_monitoring(self, on_change: Callable[[], None]) -> bool:
+        self.stop_monitoring()
+        core_ids: List[int] = []
+
+        def _on_ratbag_signal(_event: DBusSignalEvent) -> None:
+            on_change()
+
+        def _on_name_owner_changed(event: DBusSignalEvent) -> None:
+            if event.args and event.args[0] == RATBAG_SERVICE:
+                self._activation_failed = False
+                on_change()
+
+        for sig_args in (
+            (RATBAG_SERVICE, "", DBUS_PROPERTIES_IFACE, "PropertiesChanged", _on_ratbag_signal),
+            (RATBAG_SERVICE, "", RATBAG_DEVICE_IFACE, "Resync", _on_ratbag_signal),
+            (RATBAG_SERVICE, RATBAG_MANAGER_PATH, RATBAG_MANAGER_IFACE, "DeviceNew", _on_ratbag_signal),
+            (RATBAG_SERVICE, RATBAG_MANAGER_PATH, RATBAG_MANAGER_IFACE, "DeviceRemoved", _on_ratbag_signal),
+        ):
+            sub_id = self._dbus.subscribe_signal(*sig_args)
+            if sub_id is not None:
+                core_ids.append(sub_id)
+                self._subscription_ids.append(sub_id)
+
+        name_sub_id = self._dbus.subscribe_signal(
+            DBUS_SERVICE,
+            DBUS_PATH,
+            DBUS_IFACE,
+            "NameOwnerChanged",
+            _on_name_owner_changed,
+        )
+        if name_sub_id is not None:
+            self._subscription_ids.append(name_sub_id)
+
+        return len(core_ids) > 0
+
+    def stop_monitoring(self) -> None:
+        for sub_id in self._subscription_ids:
+            self._dbus.unsubscribe_signal(sub_id)
+        self._subscription_ids.clear()
 
     def scan_devices(self) -> List[Device]:
         if not self.is_available():
@@ -404,81 +688,199 @@ class RatbagBackend(BaseBackend):
 
         devices: List[Device] = []
         try:
-            res = subprocess.run(
-                [self._ctl, "list"],
-                capture_output=True,
-                text=True,
-                timeout=6,
+            mgr_props = self._dbus.get_all_properties(
+                RATBAG_SERVICE,
+                RATBAG_MANAGER_PATH,
+                RATBAG_MANAGER_IFACE,
             )
-            if res.returncode != 0:
+            raw_paths = mgr_props.get("Devices") or []
+            if not isinstance(raw_paths, (list, tuple)):
                 return []
 
-
-            lines = res.stdout.strip().splitlines()
-            for line in lines:
-                if ":" not in line:
-                    continue
-                dev_id, dev_name = line.split(":", 1)
-                dev_id = dev_id.strip()
-                dev_name = dev_name.strip()
-
-                dev = self._inspect_device(dev_id, dev_name)
+            for raw_path in raw_paths:
+                dev_path = str(raw_path)
+                dev_id = f"ratbag_{dev_path.rsplit('/', 1)[-1]}"
+                dev = self._inspect_device(dev_id, dev_path)
                 if dev:
                     devices.append(dev)
 
-        except Exception:
-            pass
+        except DBusError as exc:
+            logger.warning("RatbagBackend D-Bus scan_devices failed: %s", exc)
+        except Exception as exc:
+            logger.warning("RatbagBackend scan_devices failed: %s", exc)
 
         return devices
 
-    def _inspect_device(self, dev_id: str, dev_name: str) -> Optional[Device]:
+    def _resolve_device_path(self, device_id: str) -> Optional[str]:
+        with self._topology_lock:
+            cached = self._device_paths.get(device_id)
+        if cached:
+            return cached
+        if device_id.startswith("/org/freedesktop/ratbag1/"):
+            with self._topology_lock:
+                self._device_paths[device_id] = device_id
+            return device_id
+
         try:
-            info_res = subprocess.run(
-                [self._ctl, dev_id, "info"],
-                capture_output=True,
-                text=True,
-                timeout=8,
+            mgr_props = self._dbus.get_all_properties(
+                RATBAG_SERVICE,
+                RATBAG_MANAGER_PATH,
+                RATBAG_MANAGER_IFACE,
             )
-            if info_res.returncode != 0:
+            for raw_path in mgr_props.get("Devices") or []:
+                path = str(raw_path)
+                leaf = path.rsplit("/", 1)[-1]
+                if device_id in (path, leaf, f"ratbag_{leaf}"):
+                    with self._topology_lock:
+                        self._device_paths[device_id] = path
+                    return path
+        except DBusError as exc:
+            logger.debug("Could not resolve ratbag device path for %s: %s", device_id, exc)
+        return None
+
+    def _ensure_device_profiles(self, device_id: str, dev_path: str) -> Dict[int, str]:
+        with self._topology_lock:
+            prof_map = self._profile_paths.get(device_id)
+            if prof_map:
+                return dict(prof_map)
+
+        dev_props = self._dbus.get_all_properties(RATBAG_SERVICE, dev_path, RATBAG_DEVICE_IFACE)
+        prof_paths = [str(p) for p in (dev_props.get("Profiles") or [])]
+        new_map: Dict[int, str] = {}
+        active_fallback: Optional[int] = None
+        for i, prof_path in enumerate(prof_paths):
+            prof_props = self._dbus.get_all_properties(RATBAG_SERVICE, prof_path, RATBAG_PROFILE_IFACE)
+            p_idx = int(prof_props["Index"]) if "Index" in prof_props else i
+            new_map[p_idx] = prof_path
+            if prof_props.get("IsActive") and not prof_props.get("Disabled", False):
+                active_fallback = p_idx
+        with self._topology_lock:
+            self._profile_paths[device_id] = new_map
+            if device_id not in self._active_profiles and active_fallback is not None:
+                self._active_profiles[device_id] = active_fallback
+        return dict(new_map)
+
+    def _ensure_profile_topology(self, device_id: str, dev_path: str, profile_idx: int) -> None:
+        prof_map = self._ensure_device_profiles(device_id, dev_path)
+        prof_path = prof_map.get(profile_idx)
+        if not prof_path:
+            return
+
+        with self._topology_lock:
+            prof_btn_map = self._button_paths.get(device_id, {}).get(profile_idx)
+            prof_res_map = self._resolution_paths.get(device_id, {}).get(profile_idx)
+        if prof_btn_map is not None and prof_res_map is not None:
+            return
+
+        prof_props = self._dbus.get_all_properties(RATBAG_SERVICE, prof_path, RATBAG_PROFILE_IFACE)
+        new_res_dict: Optional[Dict[int, str]] = None
+        new_xy_dict: Optional[Dict[int, bool]] = None
+        if prof_res_map is None:
+            new_res_dict = {}
+            new_xy_dict = {}
+            for i, raw_r in enumerate(prof_props.get("Resolutions") or []):
+                r_path = str(raw_r)
+                r_props = self._dbus.get_all_properties(RATBAG_SERVICE, r_path, RATBAG_RESOLUTION_IFACE)
+                r_idx = int(r_props["Index"]) if "Index" in r_props else i
+                new_res_dict[r_idx] = r_path
+                new_xy_dict[r_idx] = len(unpack_dbus_resolution(r_props.get("Resolution"))) == 2
+
+        new_btn_dict: Optional[Dict[int, str]] = None
+        if prof_btn_map is None:
+            new_btn_dict = {}
+            for i, raw_b in enumerate(prof_props.get("Buttons") or []):
+                b_path = str(raw_b)
+                b_props = self._dbus.get_all_properties(RATBAG_SERVICE, b_path, RATBAG_BUTTON_IFACE)
+                b_idx = int(b_props["Index"]) if "Index" in b_props else i
+                new_btn_dict[b_idx] = b_path
+
+        with self._topology_lock:
+            if new_res_dict is not None and new_xy_dict is not None:
+                self._resolution_paths.setdefault(device_id, {})[profile_idx] = new_res_dict
+                self._resolution_is_xy.setdefault(device_id, {})[profile_idx] = new_xy_dict
+            if new_btn_dict is not None:
+                self._button_paths.setdefault(device_id, {})[profile_idx] = new_btn_dict
+
+    def _commit(self, dev_path: str) -> bool:
+        try:
+            reply = self._dbus.call_method(
+                RATBAG_SERVICE,
+                dev_path,
+                RATBAG_DEVICE_IFACE,
+                "Commit",
+            )
+            if not reply:
+                return True
+            return int(reply[0]) == 0
+        except DBusError as exc:
+            logger.warning("ratbagd Commit failed on %s: %s", dev_path, exc)
+            return False
+
+    def _set_resolution_active(self, res_path: str) -> bool:
+        reply = self._dbus.call_method(
+            RATBAG_SERVICE,
+            res_path,
+            RATBAG_RESOLUTION_IFACE,
+            "SetActive",
+        )
+        return not reply or int(reply[0]) == 0
+
+    def _inspect_device(self, dev_id: str, dev_path: Optional[str] = None) -> Optional[Device]:
+        try:
+            resolved_path = dev_path or self._resolve_device_path(dev_id)
+            if not resolved_path:
                 return None
 
-            lines = info_res.stdout.splitlines()
-            vid, pid = "", ""
-            num_buttons = 0
-            profiles: Dict[int, Dict[str, object]] = {}
-            current_prof_idx: Optional[int] = None
-            ratbag_active_idx: Optional[int] = None
+            dev_props = self._dbus.get_all_properties(RATBAG_SERVICE, resolved_path, RATBAG_DEVICE_IFACE)
+            if not dev_props:
+                return None
 
-            for line in lines:
-                line_s = line.strip()
-                if "Model: usb:" in line_s:
-                    parts = line_s.split("Model: usb:")[1].split(":")
-                    if len(parts) >= 2:
-                        vid, pid = parts[0].strip().lower(), parts[1].strip().lower()
-                elif "Number of Buttons:" in line_s:
-                    try:
-                        num_buttons = int(line_s.split(":", 1)[1].strip())
-                    except ValueError:
-                        pass
-                else:
-                    pm = re.match(r"Profile\s+(\d+):", line_s)
-                    if pm:
-                        current_prof_idx = int(pm.group(1))
-                        profiles[current_prof_idx] = {
-                            "disabled": "(disabled)" in line_s,
-                            "lines": [],
-                        }
-                        if "(active)" in line_s:
-                            ratbag_active_idx = current_prof_idx
-                    elif current_prof_idx is not None:
-                        profiles[current_prof_idx]["lines"].append(line_s)
+            dev_name = str(dev_props.get("Name") or "").strip() or dev_id
+            vid, pid = _parse_model_usb_ids(str(dev_props.get("Model") or ""))
+
+            raw_dtype = int(dev_props.get("DeviceType") or int(RatbagDeviceType.MOUSE))
+            if raw_dtype == int(RatbagDeviceType.KEYBOARD):
+                device_type = DeviceType.KEYBOARD
+            elif raw_dtype == int(RatbagDeviceType.OTHER):
+                device_type = DeviceType.OTHER
+            else:
+                device_type = DeviceType.MOUSE
+
+            local_profile_paths: Dict[int, str] = {}
+            local_res_paths: Dict[int, str] = {}
+            local_res_xy: Dict[int, bool] = {}
+            local_btn_paths: Dict[int, str] = {}
+            local_res_map: Dict[int, int] = {}
+
+            profiles_info: Dict[int, Dict[str, Any]] = {}
+            ratbag_active_idx: Optional[int] = None
+            for i, raw_p in enumerate(dev_props.get("Profiles") or []):
+                p_path = str(raw_p)
+                p_props = self._dbus.get_all_properties(RATBAG_SERVICE, p_path, RATBAG_PROFILE_IFACE)
+                p_idx = int(p_props["Index"]) if "Index" in p_props else i
+                local_profile_paths[p_idx] = p_path
+                disabled = bool(p_props.get("Disabled", False))
+                is_active = bool(p_props.get("IsActive", False))
+                profiles_info[p_idx] = {
+                    "path": p_path,
+                    "disabled": disabled,
+                    "is_active": is_active,
+                    "resolutions": [str(r) for r in (p_props.get("Resolutions") or [])],
+                    "buttons": [str(b) for b in (p_props.get("Buttons") or [])],
+                }
+                if is_active:
+                    ratbag_active_idx = p_idx
 
             caps = [Capability.PROFILES]
-            if vid and pid:
-                self._usb_ids[dev_id] = (vid, pid)
+            usb_id = (vid, pid) if (vid and pid) else None
+            hidpp_kwargs = {"device_name": dev_name, "device_key": dev_id} if dev_name else {}
 
             # ratbagd does not track hardware onboard profile switches; prefer live HID++ profile.
-            onboard_profile_id = hidpp.get_onboard_profile(vid, pid) if (vid and pid) else None
+            onboard_profile_id = (
+                hidpp.get_onboard_profile(vid, pid, **hidpp_kwargs)
+                if usb_id
+                else None
+            )
             onboard_profile = (
                 hidpp.format_onboard_profile(onboard_profile_id)
                 if onboard_profile_id is not None
@@ -489,13 +891,14 @@ class RatbagBackend(BaseBackend):
             selected_profile_idx: Optional[int] = None
             if (
                 hw_profile_idx is not None
-                and hw_profile_idx in profiles
-                and not profiles[hw_profile_idx]["disabled"]
+                and hw_profile_idx in profiles_info
+                and not profiles_info[hw_profile_idx]["disabled"]
             ):
                 selected_profile_idx = hw_profile_idx
             elif (
                 ratbag_active_idx is not None
-                and not profiles[ratbag_active_idx]["disabled"]
+                and ratbag_active_idx in profiles_info
+                and not profiles_info[ratbag_active_idx]["disabled"]
             ):
                 selected_profile_idx = ratbag_active_idx
 
@@ -507,46 +910,58 @@ class RatbagBackend(BaseBackend):
                 dpi_info.is_disabled = True
                 status_note = "On-board memory profile disabled"
             else:
-                self._active_profiles[dev_id] = selected_profile_idx
                 caps.extend([Capability.DPI, Capability.BUTTON_REMAP])
-                active_profile_lines: List[str] = profiles[selected_profile_idx]["lines"]  # type: ignore[assignment]
+                prof_data = profiles_info[selected_profile_idx]
+                dpi_info = self._read_dpi(
+                    dev_id,
+                    prof_data["resolutions"],
+                    profile_idx=selected_profile_idx,
+                    usb_id=usb_id,
+                    hidpp_kwargs=hidpp_kwargs,
+                    res_paths_out=local_res_paths,
+                    res_xy_out=local_res_xy,
+                    res_map_out=local_res_map,
+                )
+                buttons = self._read_buttons(
+                    dev_id,
+                    prof_data["buttons"],
+                    dev_name=dev_name,
+                    vid=vid,
+                    pid=pid,
+                    profile_idx=selected_profile_idx,
+                    btn_paths_out=local_btn_paths,
+                )
 
-                dpi_info = self._get_dpi(dev_id, active_profile_lines, profile_idx=selected_profile_idx)
+            layout = find_device_layout(dev_name, vid, pid)
+            vendor = (
+                layout.vendor
+                if layout is not None
+                else ("Logitech" if "logitech" in dev_name.lower() or "046d" in vid else "Generic")
+            )
 
-                for line_s in active_profile_lines:
-                    if line_s.startswith("Button:"):
-                        m = re.match(r"Button:\s*(\d+)\s+is mapped to\s+(.*)", line_s)
-                        if m:
-                            b_idx = int(m.group(1))
-                            raw_val = m.group(2).strip()
-                            act_val, act_disp = parse_button_action(raw_val)
-                            # If Button 0 (Left Click) is unmapped or unknown, keep Left Click safe
-                            if b_idx == 0 and act_val == "unknown":
-                                act_val, act_disp = "button 1", "Left Click"
-                            meta = get_button_metadata(dev_name, vid, pid, b_idx, act_val, num_buttons)
-                            buttons.append(
-                                ButtonMapping(
-                                    index=b_idx,
-                                    name=meta["name"],
-                                    action_value=act_val,
-                                    action_display=act_disp,
-                                    label=meta["label"],
-                                    location=meta["location"],
-                                    group=meta["group"],
-                                    default_action=meta["default"],
-                                )
-                            )
-
-                if not buttons:
-                    buttons = self._get_buttons(
-                        dev_id, num_buttons, dev_name, vid, pid, profile_idx=selected_profile_idx
-                    )
+            with self._topology_lock:
+                self._device_paths[dev_id] = resolved_path
+                self._profile_paths[dev_id] = local_profile_paths
+                if selected_profile_idx is not None:
+                    self._resolution_paths[dev_id] = {selected_profile_idx: local_res_paths}
+                    self._resolution_is_xy[dev_id] = {selected_profile_idx: local_res_xy}
+                    self._button_paths[dev_id] = {selected_profile_idx: local_btn_paths}
+                    self._resolution_maps[dev_id] = local_res_map
+                    self._active_profiles[dev_id] = selected_profile_idx
+                else:
+                    self._resolution_paths[dev_id] = {}
+                    self._resolution_is_xy[dev_id] = {}
+                    self._button_paths[dev_id] = {}
+                if usb_id:
+                    self._usb_ids[dev_id] = usb_id
+                if dev_name:
+                    self._device_names[dev_id] = dev_name
 
             return Device(
                 id=dev_id,
                 name=dev_name,
-                vendor="Logitech" if "logitech" in dev_name.lower() or "046d" in vid else "Generic",
-                device_type=DeviceType.MOUSE,
+                vendor=vendor,
+                device_type=device_type,
                 usb_vid=vid,
                 usb_pid=pid,
                 capabilities=caps,
@@ -555,69 +970,84 @@ class RatbagBackend(BaseBackend):
                 onboard_profile_id=onboard_profile_id,
                 onboard_profile=onboard_profile,
                 status_note=status_note,
+                extra_props={"dbus_path": resolved_path},
                 backend_name=self.name,
             )
-        except Exception:
+        except Exception as exc:
+            logger.warning("Failed to inspect ratbag device %s: %s", dev_id, exc)
             return None
 
-    def _get_dpi(
+    def _read_dpi(
         self,
         dev_id: str,
-        active_profile_lines: Optional[List[str]] = None,
-        profile_idx: Optional[int] = None,
+        res_paths: List[str],
+        profile_idx: int = 0,
+        usb_id: Optional[Tuple[str, str]] = None,
+        hidpp_kwargs: Optional[Dict[str, Any]] = None,
+        res_paths_out: Optional[Dict[int, str]] = None,
+        res_xy_out: Optional[Dict[int, bool]] = None,
+        res_map_out: Optional[Dict[int, int]] = None,
     ) -> DpiInfo:
         info = DpiInfo()
         valid_steps: List[int] = []
-        current_from_lines: Optional[int] = None
-        res_map: Dict[int, int] = {}
+        current_from_ratbag: Optional[int] = None
+        res_map: Dict[int, int] = res_map_out if res_map_out is not None else {}
+        supported_vals: List[int] = []
 
-        if active_profile_lines:
-            in_res = False
-            for line in active_profile_lines:
-                line_s = line.strip()
-                if line_s.startswith("Resolutions:"):
-                    in_res = True
-                    continue
-                elif in_res and (line_s.startswith("Button:") or line_s.startswith("Led:") or line_s.startswith("Report Rate:")):
-                    in_res = False
-                if in_res:
-                    m = re.search(r"(\d+):\s*(\d+)(?:x\d+)?\s*dpi", line_s.lower())
-                    if m:
-                        idx = int(m.group(1))
-                        val = int(m.group(2))
-                        if 50 <= val <= 30000:
-                            if val not in valid_steps:
-                                valid_steps.append(val)
-                            res_map[val] = idx
-                            if "(active)" in line_s.lower():
-                                current_from_lines = val
+        dev_res_paths: Dict[int, str] = res_paths_out if res_paths_out is not None else {}
+        dev_res_xy: Dict[int, bool] = res_xy_out if res_xy_out is not None else {}
 
-        self._resolution_maps[dev_id] = res_map
+        for i, res_path in enumerate(res_paths):
+            try:
+                r_props = self._dbus.get_all_properties(
+                    RATBAG_SERVICE,
+                    res_path,
+                    RATBAG_RESOLUTION_IFACE,
+                )
+            except DBusError as exc:
+                logger.debug("Failed to read resolution %s for %s: %s", res_path, dev_id, exc)
+                continue
 
-        try:
-            prof_args = ["profile", str(profile_idx)] if profile_idx is not None else []
-            res = subprocess.run(
-                [self._ctl, dev_id] + prof_args + ["dpi", "get"],
-                capture_output=True,
-                text=True,
-                timeout=3,
-            )
-            if res.returncode == 0:
-                m = re.search(r"(\d+)(?:x\d+)?\s*dpi", res.stdout.strip().lower())
-                if m:
-                    val = int(m.group(1))
-                    if 50 <= val <= 30000:
-                        info.current = val
-            elif current_from_lines:
-                info.current = current_from_lines
-        except Exception:
-            if current_from_lines:
-                info.current = current_from_lines
+            r_idx = int(r_props["Index"]) if "Index" in r_props else i
+            dev_res_paths[r_idx] = res_path
+
+            res_tuple = unpack_dbus_resolution(r_props.get("Resolution"))
+            dev_res_xy[r_idx] = len(res_tuple) == 2
+
+            for raw_supported in r_props.get("Resolutions") or []:
+                if isinstance(raw_supported, (int, float)) and 50 <= int(raw_supported) <= 30000:
+                    supported_vals.append(int(raw_supported))
+
+            is_disabled = bool(r_props.get("IsDisabled", False))
+            is_active = bool(r_props.get("IsActive", False))
+            val = res_tuple[0] if res_tuple else 0
+
+            if not is_disabled and 50 <= val <= 30000:
+                if val not in valid_steps:
+                    valid_steps.append(val)
+                res_map[val] = r_idx
+                if is_active:
+                    current_from_ratbag = val
+
+        if res_paths_out is None or res_xy_out is None or res_map_out is None:
+            with self._topology_lock:
+                if res_paths_out is None:
+                    self._resolution_paths.setdefault(dev_id, {})[profile_idx] = dev_res_paths
+                if res_xy_out is None:
+                    self._resolution_is_xy.setdefault(dev_id, {})[profile_idx] = dev_res_xy
+                if res_map_out is None:
+                    self._resolution_maps[dev_id] = res_map
+
+        if current_from_ratbag is not None:
+            info.current = current_from_ratbag
 
         # ratbagd's value is stale when profile commits fail; the device itself is authoritative.
-        usb_id = self._usb_ids.get(dev_id)
+        if usb_id is None:
+            with self._topology_lock:
+                usb_id = self._usb_ids.get(dev_id)
         if usb_id:
-            hw_dpi = hidpp.get_dpi(*usb_id)
+            kw = hidpp_kwargs if hidpp_kwargs is not None else self._hidpp_kwargs(dev_id)
+            hw_dpi = hidpp.get_dpi(*usb_id, **kw)
             if hw_dpi and 50 <= hw_dpi <= 30000:
                 info.current = hw_dpi
 
@@ -630,92 +1060,176 @@ class RatbagBackend(BaseBackend):
             steps_set = set(default_presets + valid_steps)
         if info.current:
             steps_set.add(info.current)
-        info.steps = sorted(list(steps_set))
+        info.steps = sorted(steps_set)
+        if supported_vals:
+            info.min_dpi = min(supported_vals)
+            info.max_dpi = max(supported_vals)
         return info
 
-    def _get_buttons(
+    def _read_buttons(
         self,
         dev_id: str,
-        count: int,
+        btn_paths: List[str],
         dev_name: str = "",
         vid: str = "",
         pid: str = "",
-        profile_idx: Optional[int] = None,
+        profile_idx: int = 0,
+        btn_paths_out: Optional[Dict[int, str]] = None,
     ) -> List[ButtonMapping]:
-        buttons = []
-        max_b = min(12, count if count > 0 else 8)
-        prof_args = ["profile", str(profile_idx)] if profile_idx is not None else []
-        for idx in range(max_b):
+        buttons: List[ButtonMapping] = []
+        dev_btn_paths: Dict[int, str] = btn_paths_out if btn_paths_out is not None else {}
+
+        parsed_entries: List[Tuple[int, str, str]] = []
+        for i, btn_path in enumerate(btn_paths):
             try:
-                res = subprocess.run(
-                    [self._ctl, dev_id] + prof_args + ["button", str(idx), "action", "get"],
-                    capture_output=True,
-                    text=True,
-                    timeout=1,
+                b_props = self._dbus.get_all_properties(
+                    RATBAG_SERVICE,
+                    btn_path,
+                    RATBAG_BUTTON_IFACE,
                 )
-                act_val, act_disp = "unknown", "Default / Unknown"
-                if res.returncode == 0:
-                    raw = res.stdout.strip()
-                    if " is mapped to " in raw:
-                        raw = raw.split(" is mapped to ", 1)[1]
-                    act_val, act_disp = parse_button_action(raw)
-                meta = get_button_metadata(dev_name, vid, pid, idx, act_val, max_b)
-                buttons.append(
-                    ButtonMapping(
-                        index=idx,
-                        name=meta["name"],
-                        action_value=act_val,
-                        action_display=act_disp,
-                        label=meta["label"],
-                        location=meta["location"],
-                        group=meta["group"],
-                        default_action=meta["default"],
-                    )
+            except DBusError as exc:
+                logger.debug("Failed to read button %s for %s: %s", btn_path, dev_id, exc)
+                continue
+
+            b_idx = int(b_props["Index"]) if "Index" in b_props else i
+            dev_btn_paths[b_idx] = btn_path
+            act_val, act_disp = decode_dbus_button_mapping(b_props.get("Mapping"))
+            # If Button 0 (Left Click) is unmapped or unknown, keep Left Click safe
+            if b_idx == 0 and act_val == "unknown":
+                act_val, act_disp = "button 1", "Left Click"
+            parsed_entries.append((b_idx, act_val, act_disp))
+
+        if btn_paths_out is None:
+            with self._topology_lock:
+                self._button_paths.setdefault(dev_id, {})[profile_idx] = dev_btn_paths
+
+        total_buttons = len(btn_paths) if btn_paths else len(parsed_entries)
+        for b_idx, act_val, act_disp in sorted(parsed_entries, key=lambda item: item[0]):
+            meta = get_button_metadata(dev_name, vid, pid, b_idx, act_val, total_buttons)
+            buttons.append(
+                ButtonMapping(
+                    index=b_idx,
+                    name=meta["name"],
+                    action_value=act_val,
+                    action_display=act_disp,
+                    label=meta["label"],
+                    location=meta["location"],
+                    group=meta["group"],
+                    default_action=meta["default"],
                 )
-            except Exception:
-                pass
+            )
         return buttons
 
     def set_dpi(self, device_id: str, dpi: int) -> bool:
-        usb_id = self._usb_ids.get(device_id)
-        if usb_id and hidpp.set_dpi(*usb_id, dpi):
+        with self._topology_lock:
+            usb_id = self._usb_ids.get(device_id)
+        if usb_id and hidpp.set_dpi(*usb_id, dpi, **self._hidpp_kwargs(device_id)):
             return True
         if not self.is_available():
             return False
+
         try:
+            dev_path = self._resolve_device_path(device_id)
+            if not dev_path:
+                return False
+
+            profile_idx, _hidpp_prof_id = self._resolve_active_profile(device_id)
+            if profile_idx is None:
+                prof_map = self._ensure_device_profiles(device_id, dev_path)
+                with self._topology_lock:
+                    profile_idx = self._active_profiles.get(device_id)
+                if profile_idx is None and prof_map:
+                    profile_idx = sorted(prof_map.keys())[0]
+            if profile_idx is None:
+                return False
+
+            self._ensure_profile_topology(device_id, dev_path, profile_idx)
+            with self._topology_lock:
+                prof_res_paths = dict(self._resolution_paths.get(device_id, {}).get(profile_idx, {}))
+                prof_res_xy = dict(self._resolution_is_xy.get(device_id, {}).get(profile_idx, {}))
+                res_map = dict(self._resolution_maps.get(device_id, {}))
+
             # If the device has an existing resolution slot with this DPI, switch active resolution directly.
-            # This is fast, atomic, and avoids rewriting profile/EEPROM.
-            res_map = self._resolution_maps.get(device_id, {})
             if dpi in res_map:
                 slot_idx = res_map[dpi]
-                res = subprocess.run(
-                    [self._ctl, device_id, "resolution", "active", "set", str(slot_idx)],
-                    capture_output=True,
-                    text=True,
-                    timeout=3,
-                )
-                if res.returncode == 0:
-                    return True
+                slot_path = prof_res_paths.get(slot_idx)
+                if slot_path:
+                    try:
+                        if self._set_resolution_active(slot_path) and self._commit(dev_path):
+                            return True
+                    except DBusError as exc:
+                        logger.debug(
+                            "ratbagd SetActive on slot %s failed for %s: %s",
+                            slot_idx,
+                            device_id,
+                            exc,
+                        )
 
-            # If not in resolution slots or resolution switch failed, set DPI directly
-            res = subprocess.run(
-                [self._ctl, device_id, "dpi", "set", str(dpi)],
-                capture_output=True,
-                text=True,
-                timeout=4,
-            )
-            if res.returncode == 0:
-                return True
-            # Recovery: ensure an active resolution exists and retry
-            subprocess.run([self._ctl, device_id, "resolution", "active", "set", "0"], timeout=3)
-            retry = subprocess.run(
-                [self._ctl, device_id, "dpi", "set", str(dpi)],
-                capture_output=True,
-                text=True,
-                timeout=4,
-            )
-            return retry.returncode == 0
-        except Exception:
+            if not prof_res_paths:
+                return False
+
+            active_slot: Optional[int] = None
+            for r_idx, r_path in sorted(prof_res_paths.items()):
+                try:
+                    if bool(
+                        self._dbus.get_property(
+                            RATBAG_SERVICE,
+                            r_path,
+                            RATBAG_RESOLUTION_IFACE,
+                            "IsActive",
+                        )
+                    ):
+                        active_slot = r_idx
+                        break
+                except DBusError:
+                    continue
+
+            if active_slot is None:
+                first_slot = sorted(prof_res_paths.keys())[0]
+                try:
+                    self._set_resolution_active(prof_res_paths[first_slot])
+                except DBusError as exc:
+                    logger.debug("Could not activate fallback resolution 0 for %s: %s", device_id, exc)
+                active_slot = first_slot
+
+            target_path = prof_res_paths[active_slot]
+            is_xy = prof_res_xy.get(active_slot, False)
+            res_variant = ("(uu)", (int(dpi), int(dpi))) if is_xy else ("u", int(dpi))
+
+            try:
+                self._dbus.set_property(
+                    RATBAG_SERVICE,
+                    target_path,
+                    RATBAG_RESOLUTION_IFACE,
+                    "Resolution",
+                    "v",
+                    res_variant,
+                )
+                return self._commit(dev_path)
+            except DBusCallError as exc:
+                logger.debug(
+                    "ratbagd set Resolution %d failed for %s (%s); attempting active-slot recovery",
+                    dpi,
+                    device_id,
+                    exc,
+                )
+                first_slot = sorted(prof_res_paths.keys())[0]
+                fallback_path = prof_res_paths[first_slot]
+                self._set_resolution_active(fallback_path)
+                fallback_xy = prof_res_xy.get(first_slot, False)
+                fallback_variant = ("(uu)", (int(dpi), int(dpi))) if fallback_xy else ("u", int(dpi))
+                self._dbus.set_property(
+                    RATBAG_SERVICE,
+                    fallback_path,
+                    RATBAG_RESOLUTION_IFACE,
+                    "Resolution",
+                    "v",
+                    fallback_variant,
+                )
+                return self._commit(dev_path)
+
+        except Exception as exc:
+            logger.warning("Failed to set DPI %d on %s: %s", dpi, device_id, exc)
             return False
 
     def remap_button(self, device_id: str, button_idx: int, action: str) -> bool:
@@ -726,108 +1240,175 @@ class RatbagBackend(BaseBackend):
         # Prevent disabling or unmapping primary left click (Button 0)
         if button_idx == 0 and action.strip().lower() in ("disabled", "none"):
             return False
+
         try:
-            parts = action.strip().split()
-            if not parts:
+            encoded = encode_dbus_button_mapping(action)
+        except ValueError as exc:
+            logger.warning("Invalid button action for %s button %d: %s", device_id, button_idx, exc)
+            return False
+
+        try:
+            dev_path = self._resolve_device_path(device_id)
+            if not dev_path:
                 return False
+
             profile_idx, hidpp_profile_id = self._resolve_active_profile(device_id)
-            prof_args = ["profile", str(profile_idx)] if profile_idx is not None else []
-            cmd = [self._ctl, device_id] + prof_args + ["button", str(button_idx), "action", "set"] + parts
-            res = subprocess.run(
-                cmd,
-                capture_output=True,
-                timeout=8,
+            if profile_idx is None:
+                prof_map = self._ensure_device_profiles(device_id, dev_path)
+                with self._topology_lock:
+                    profile_idx = self._active_profiles.get(device_id)
+                if profile_idx is None and prof_map:
+                    profile_idx = sorted(prof_map.keys())[0]
+            if profile_idx is None:
+                return False
+
+            self._ensure_profile_topology(device_id, dev_path, profile_idx)
+            with self._topology_lock:
+                btn_path = self._button_paths.get(device_id, {}).get(profile_idx, {}).get(button_idx)
+            if not btn_path:
+                logger.warning("No ratbag button path found for %s profile %d button %d", device_id, profile_idx, button_idx)
+                return False
+
+            self._dbus.set_property(
+                RATBAG_SERVICE,
+                btn_path,
+                RATBAG_BUTTON_IFACE,
+                "Mapping",
+                "(uv)",
+                encoded,
             )
-            if res.returncode != 0:
+            if not self._commit(dev_path):
                 return False
             self._finalize_hidpp_commit(device_id, hidpp_profile_id)
             return True
-        except Exception:
+        except Exception as exc:
+            logger.warning("Failed to remap button %d on %s: %s", button_idx, device_id, exc)
             return False
 
-    def batch_remap_buttons(self, device_id: str, buttons: Dict[int, str]) -> bool:
+    def batch_remap_buttons(
+        self,
+        device_id: str,
+        buttons: Dict[int, str],
+        profile_idx: Optional[int] = None,
+    ) -> bool:
         if not self.is_available() or not buttons:
             return False
         try:
-            valid_items = [
-                (idx, act)
-                for idx, act in buttons.items()
-                if act and act.strip().lower() not in ("unknown", "standard / unbekannt", "default / unknown")
-            ]
+            valid_items: List[Tuple[int, Tuple[int, Tuple[str, Any]]]] = []
+            for idx, act in buttons.items():
+                if not act or act.strip().lower() in ("unknown", "standard / unbekannt", "default / unknown"):
+                    continue
+                if idx == 0 and act.strip().lower() in ("disabled", "none"):
+                    continue
+                try:
+                    valid_items.append((idx, encode_dbus_button_mapping(act)))
+                except ValueError as exc:
+                    logger.debug("Skipping invalid batch action for button %d on %s: %s", idx, device_id, exc)
+
             if not valid_items:
                 return True
-            profile_idx, hidpp_profile_id = self._resolve_active_profile(device_id)
-            prof_args = ["profile", str(profile_idx)] if profile_idx is not None else []
-            last_ok = False
-            for i, (idx, action) in enumerate(valid_items):
-                parts = action.strip().split()
-                if not parts:
+
+            dev_path = self._resolve_device_path(device_id)
+            if not dev_path:
+                return False
+
+            if profile_idx is None:
+                target_profile_idx, hidpp_profile_id = self._resolve_active_profile(device_id)
+                if target_profile_idx is None:
+                    prof_map = self._ensure_device_profiles(device_id, dev_path)
+                    with self._topology_lock:
+                        target_profile_idx = self._active_profiles.get(device_id)
+                    if target_profile_idx is None and prof_map:
+                        target_profile_idx = sorted(prof_map.keys())[0]
+            else:
+                target_profile_idx = profile_idx
+                hidpp_profile_id = None
+
+            if target_profile_idx is None:
+                return False
+
+            self._ensure_profile_topology(device_id, dev_path, target_profile_idx)
+            with self._topology_lock:
+                btn_paths = dict(self._button_paths.get(device_id, {}).get(target_profile_idx, {}))
+
+            written = 0
+            for idx, encoded in valid_items:
+                btn_path = btn_paths.get(idx)
+                if not btn_path:
+                    logger.debug("Missing button path for %s profile %d button %d", device_id, target_profile_idx, idx)
                     continue
-                is_last = (i == len(valid_items) - 1)
-                cmd = [self._ctl]
-                if not is_last:
-                    cmd.append("--nocommit")
-                cmd.extend([device_id] + prof_args + ["button", str(idx), "action", "set"] + parts)
-                res = subprocess.run(cmd, capture_output=True, timeout=8 if is_last else 3)
-                if is_last:
-                    last_ok = (res.returncode == 0)
-                else:
-                    time.sleep(0.04)
-            if last_ok:
+                self._dbus.set_property(
+                    RATBAG_SERVICE,
+                    btn_path,
+                    RATBAG_BUTTON_IFACE,
+                    "Mapping",
+                    "(uv)",
+                    encoded,
+                )
+                written += 1
+
+            if written == 0:
+                return False
+
+            ok = self._commit(dev_path)
+            if ok and hidpp_profile_id is not None:
                 self._finalize_hidpp_commit(device_id, hidpp_profile_id)
-            return True
-        except Exception:
+            return ok
+        except Exception as exc:
+            logger.warning("Failed batch remap on %s: %s", device_id, exc)
             return False
 
     def reset_defaults(self, device_id: str) -> bool:
         if not self.is_available():
             return False
         try:
-            # Ensure profile 1 (or active) is enabled
-            subprocess.run([self._ctl, device_id, "profile", "1", "enable"], capture_output=True, timeout=3)
+            dev_path = self._resolve_device_path(device_id)
+            if not dev_path:
+                return False
 
-            dev = self._inspect_device(device_id, "")
-            num_buttons = len(dev.buttons) if (dev and dev.buttons) else 11
+            prof_map = self._ensure_device_profiles(device_id, dev_path)
+            if 1 in prof_map:
+                try:
+                    self._dbus.set_property(
+                        RATBAG_SERVICE,
+                        prof_map[1],
+                        RATBAG_PROFILE_IFACE,
+                        "Disabled",
+                        "b",
+                        False,
+                    )
+                    self._commit(dev_path)
+                except DBusError as exc:
+                    logger.debug("Could not enable profile 1 on %s during reset: %s", device_id, exc)
 
-            if num_buttons >= 11:
-                defaults = {
-                    0: "button 1",
-                    1: "button 2",
-                    2: "button 3",
-                    3: "button 4",
-                    4: "special resolution-alternate",
-                    5: "button 5",
-                    6: "special wheel-left",
-                    7: "special wheel-right",
-                    8: "special profile-cycle-up",
-                    9: "special resolution-up",
-                    10: "special resolution-down",
-                }
-            else:
-                defaults = {
-                    0: "button 1",
-                    1: "button 2",
-                    2: "button 3",
-                    3: "button 4",
-                    4: "button 5",
-                }
+            dev = self._inspect_device(device_id, dev_path)
+            with self._topology_lock:
+                cached_vid, cached_pid = self._usb_ids.get(device_id, ("", ""))
+            dev_name = dev.name if dev else ""
+            vid = (dev.usb_vid if dev and dev.usb_vid else cached_vid) or ""
+            pid = (dev.usb_pid if dev and dev.usb_pid else cached_pid) or ""
+            total_buttons = len(dev.buttons) if (dev and dev.buttons) else None
+
+            defaults = get_factory_reset_defaults(
+                dev_name=dev_name,
+                vid=vid,
+                pid=pid,
+                total_buttons=total_buttons,
+            )
 
             # Apply defaults to active profile
             self.batch_remap_buttons(device_id, defaults)
 
             # Ensure profile 0 also has valid mappings to prevent broken fallback
-            for idx, action in defaults.items():
-                parts = action.split()
-                subprocess.run(
-                    [self._ctl, device_id, "profile", "0", "button", str(idx), "action", "set"] + parts,
-                    capture_output=True,
-                    timeout=3,
-                )
-                time.sleep(0.04)
+            with self._topology_lock:
+                has_prof_0 = 0 in self._profile_paths.get(device_id, {})
+                active_prof = self._active_profiles.get(device_id)
+            if has_prof_0 and active_prof != 0:
+                self.batch_remap_buttons(device_id, defaults, profile_idx=0)
 
             target_dpi = 1600 if (dev and dev.dpi and 1600 in dev.dpi.steps) else 800
             self.set_dpi(device_id, target_dpi)
             return True
-        except Exception:
+        except Exception as exc:
+            logger.warning("Failed resetting defaults on %s: %s", device_id, exc)
             return False
-

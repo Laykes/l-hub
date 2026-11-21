@@ -1,0 +1,106 @@
+{
+  "id": "logitech_g502",
+  "name": "Logitech G502 Series",
+  "vendor": "Logitech",
+  "vid": "046d",
+  "pids": [
+    "c099",
+    "c092",
+    "c07d",
+    "c332",
+    "c08b"
+  ],
+  "name_patterns": [
+    "g502"
+  ],
+  "buttons": [
+    {
+      "index": 0,
+      "name": "Left Click (LMB)",
+      "label": "Left Click",
+      "location": "Primary Left",
+      "group": "main",
+      "default": "button 1"
+    },
+    {
+      "index": 1,
+      "name": "Right Click (RMB)",
+      "label": "Right Click",
+      "location": "Primary Right",
+      "group": "main",
+      "default": "button 2"
+    },
+    {
+      "index": 2,
+      "name": "Middle Click (Wheel)",
+      "label": "Wheel Click",
+      "location": "Scroll Wheel",
+      "group": "wheel",
+      "default": "button 3"
+    },
+    {
+      "index": 3,
+      "name": "Side Back (G4)",
+      "label": "Back",
+      "location": "Thumb Rest (Rear)",
+      "group": "side",
+      "default": "button 4"
+    },
+    {
+      "index": 4,
+      "name": "DPI Shift / Sniper (G6)",
+      "label": "Sniper / Shift",
+      "location": "Thumb Tip (Front)",
+      "group": "side",
+      "default": "special resolution-alternate"
+    },
+    {
+      "index": 5,
+      "name": "Side Forward (G5)",
+      "label": "Forward",
+      "location": "Thumb Rest (Front)",
+      "group": "side",
+      "default": "button 5"
+    },
+    {
+      "index": 6,
+      "name": "Wheel Tilt Left",
+      "label": "Tilt Left",
+      "location": "Scroll Wheel",
+      "group": "wheel",
+      "default": "special wheel-left"
+    },
+    {
+      "index": 7,
+      "name": "Wheel Tilt Right",
+      "label": "Tilt Right",
+      "location": "Scroll Wheel",
+      "group": "wheel",
+      "default": "special wheel-right"
+    },
+    {
+      "index": 8,
+      "name": "Profile Switch (G9)",
+      "label": "Profile Switch",
+      "location": "Behind Wheel",
+      "group": "dpi",
+      "default": "special profile-cycle-up"
+    },
+    {
+      "index": 9,
+      "name": "DPI Up (G8)",
+      "label": "DPI Up",
+      "location": "Left of LMB",
+      "group": "dpi",
+      "default": "special resolution-up"
+    },
+    {
+      "index": 10,
+      "name": "DPI Down (G7)",
+      "label": "DPI Down",
+      "location": "Left of LMB",
+      "group": "dpi",
+      "default": "special resolution-down"
+    }
+  ]
+}

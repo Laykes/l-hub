@@ -1,3 +1,4 @@
+import logging
 import shutil
 import subprocess
 from pathlib import Path
@@ -7,6 +8,8 @@ from PySide6.QtGui import QIcon, QAction
 from PySide6.QtCore import QObject
 
 from .single_instance import restore_window
+
+logger = logging.getLogger(__name__)
 
 ICON_PATH = Path(__file__).resolve().parent / "assets" / "io.github.lhub.LHub.svg"
 
@@ -110,10 +113,13 @@ class LHubTray(QObject):
                     stdout=subprocess.DEVNULL,
                     stderr=subprocess.DEVNULL,
                 )
-            except OSError:
-                pass
+            except OSError as exc:
+                logger.warning("Failed to send desktop notification via notify-send: %s", exc)
 
     def _on_battery_warning(self, name: str, percentage: int):
+        manager = getattr(self, "manager", None)
+        if manager is not None and not getattr(manager, "notifyLowBattery", True):
+            return
         self._notify(
             "Low Battery",
             f"{name} battery is down to {percentage}%!",
@@ -122,6 +128,9 @@ class LHubTray(QObject):
         )
 
     def _on_onboard_profile_changed(self, device_name: str, profile_label: str):
+        manager = getattr(self, "manager", None)
+        if manager is not None and not getattr(manager, "notifyProfileChange", True):
+            return
         self._notify(
             device_name,
             f"Onboard Profile: {profile_label}",
