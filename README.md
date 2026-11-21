@@ -14,23 +14,38 @@ L-Hub provides a unified, native interface to configure gaming mice and headsets
 
 ## Features
 
-- **Gaming Mice (via `libratbag` / `ratbagd`)**
-  - **DPI Management**: Switch between active DPI resolution steps or configure presets on the fly.
+- **Gaming Mice (via `libratbag` / `ratbagd` & HID++ 2.0)**
+  - **DPI Management**: Switch between active DPI resolution steps or change DPI on the fly (including direct HID++ 2.0 runtime DPI for supported Logitech mice).
   - **Button Remapping**: Remap buttons to standard mouse clicks, keyboard keys/shortcuts, media controls, DPI cycle, sniper mode, or disable buttons.
-  - **Interactive Button Tester**: Press physical buttons on your mouse to immediately highlight and identify their internal index in the UI.
-  - **Custom Profiles**: Create, save, switch, and delete per-device profiles (stored in `~/.config/lhub/profiles.json`), or restore factory defaults anytime.
+  - **Interactive Button Tester**: Press physical buttons on your mouse to immediately highlight and identify them in the UI — uses raw USB HID (`/dev/hidraw*`) so custom keybinds, media keys, and shortcuts are recognized too.
+  - **Custom & On-Board Profiles**: Create, save, switch, and delete per-device profiles (stored in `~/.config/lhub/profiles.json`), track live Logitech HID++ on-board profile changes, or restore defaults.
 
 - **Gaming Headsets (via `headsetcontrol`)**
   - **Live Battery Status**: Real-time battery percentage readout and remaining battery runtime estimation.
   - **Sidetone Adjustment**: Control mic monitoring / loopback level with a responsive slider.
 
 - **Universal Peripheral Monitoring (via `UPower`)**
-  - Automatic detection and battery level monitoring for wireless mice, keyboards, and bluetooth peripherals.
+  - Automatic detection and battery level monitoring for wireless mice, keyboards, and Bluetooth peripherals.
 
 - **Desktop & System Tray Integration**
-  - Native KDE Plasma / Kirigami interface following system color schemes and dark/light modes.
+  - Dark-themed KDE Plasma / Kirigami (Qt 6) interface.
   - System tray icon displaying connected device battery levels at a glance.
-  - Automatic desktop notifications on low battery warnings (below 20%).
+  - Automatic desktop notifications on low battery warnings (below 20%) and on-board profile switches.
+
+---
+
+## Supported Devices
+
+L-Hub is not locked to a single vendor or device model — hardware support comes from its underlying Linux backends:
+
+- **Mice**: Any gaming mouse supported by [`libratbag`](https://github.com/libratbag/libratbag/tree/master/data/devices) (Logitech G, Razer, SteelSeries, Glorious, Roccat, etc.).
+- **Headsets**: Any headset supported by [`HeadsetControl`](https://github.com/Sapd/HeadsetControl#supported-headsets) (Logitech, Corsair, SteelSeries, HyperX, Razer, etc.).
+- **Battery-only fallback**: Any wireless peripheral exposed via `UPower`.
+
+> [!NOTE]
+> **Current hardware caveats:**
+> - Detailed physical button names and the 11-button factory-reset layout are currently tailored to the **Logitech G502** series. Other `libratbag`-supported mice still work for DPI and button remapping, using generic button labels (`Button 6`, `Button 7`, etc.).
+> - Direct **HID++ 2.0** features (runtime DPI and live on-board profile notifications) currently target wired/direct Logitech USB devices (`0xFF` device index).
 
 ---
 
@@ -46,12 +61,12 @@ L-Hub provides a unified, native interface to configure gaming mice and headsets
 
 ## Roadmap
 
-Planned capabilities:
+Planned improvements:
 
-- [ ] **RGB / LED Lighting Control** (ratbag & OpenRGB integration)
-- [ ] **Advanced Macros & Key Sequences**
-- [ ] **Hardware-specific settings** (polling rate, debounce time, angle snapping, lift-off distance)
-- [ ] **Flatpak / AppImage packages** for easy distribution
+- [ ] **Broader Mouse Layout Support**: Per-model button metadata & safe factory-reset defaults beyond the Logitech G502 series
+- [ ] **Wireless HID++ Receiver Support**: Extend live HID++ 2.0 profile/DPI tracking to Lightspeed / Unifying / Bolt dongles
+- [ ] **Advanced Macros & Key Sequences**: Multi-step macro editor in the remap dialog
+- [ ] **Packaging**: AUR `PKGBUILD`, Flatpak, or AppImage for easier installation
 
 ---
 
@@ -134,12 +149,18 @@ Or, if installed with `pip install -e .`:
 l-hub
 ```
 
-### Desktop Entry
+### Desktop Entry & App Icon
 
-To launch L-Hub from your desktop application launcher (KRunner, Kickoff, GNOME Shell, etc.), copy the desktop file to your user applications folder:
+To install the launcher (`~/.local/bin/l-hub`), application icon, and desktop entry for KRunner / Kickoff / app menus, run:
 
 ```bash
-cp io.github.lhub.LHub.desktop ~/.local/share/applications/
+./install.sh
+```
+
+To remove them later:
+
+```bash
+./install.sh --uninstall
 ```
 
 ---
@@ -161,6 +182,8 @@ lhub/
 ├── backends/          # Hardware abstraction layer
 │   ├── base.py        # Generic Device & Capability models
 │   ├── ratbag.py      # libratbag / ratbagctl integration for mice
+│   ├── hidpp.py       # Logitech HID++ 2.0 runtime DPI & live onboard profile events
+│   ├── hid_input.py   # Read-only raw USB HID monitor for button identification
 │   ├── headset.py     # HeadsetControl integration for headsets
 │   └── upower.py      # UPower fallback for wireless devices
 ├── profiles.py        # JSON-based persistent profile management
@@ -169,7 +192,9 @@ lhub/
 ├── qml/               # Kirigami / QtQuick user interface
 │   ├── main.qml       # Main application window & dialogs
 │   ├── DeviceCard.qml # Card component representing a peripheral
-│   └── RemapDialog.qml# Button remapping interface
+│   ├── RemapDialog.qml# Button remapping interface
+│   ├── Theme.qml      # Dark theme palette & styling tokens
+│   └── UiButton.qml   # Reusable styled button component
 └── main.py            # Application entry point & Qt event loop
 ```
 
