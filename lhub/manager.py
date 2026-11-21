@@ -13,9 +13,95 @@ from .backends import (
     HeadsetBackend,
     UPowerBackend,
 )
-from .backends import hidpp
-from .backends.ratbag import parse_button_action, KEY_DISPLAY_NAMES
+from .backends import hidpp, hid_input
+from .backends.ratbag import (
+    parse_button_action,
+    KEY_DISPLAY_NAMES,
+    format_key_combo,
+    actions_match,
+)
 from .profiles import ProfileManager
+
+
+_QT_MODIFIER_KEYS: Dict[int, str] = {
+    Qt.Key.Key_Shift: "KEY_LEFTSHIFT",
+    Qt.Key.Key_Control: "KEY_LEFTCTRL",
+    Qt.Key.Key_Meta: "KEY_LEFTMETA",
+    Qt.Key.Key_Alt: "KEY_LEFTALT",
+    Qt.Key.Key_AltGr: "KEY_RIGHTALT",
+}
+
+_QT_TO_LINUX_KEY: Dict[int, str] = {
+    Qt.Key.Key_Escape: "KEY_ESC",
+    Qt.Key.Key_Tab: "KEY_TAB",
+    Qt.Key.Key_Backtab: "KEY_TAB",
+    Qt.Key.Key_Backspace: "KEY_BACKSPACE",
+    Qt.Key.Key_Return: "KEY_ENTER",
+    Qt.Key.Key_Enter: "KEY_ENTER",
+    Qt.Key.Key_Insert: "KEY_INSERT",
+    Qt.Key.Key_Delete: "KEY_DELETE",
+    Qt.Key.Key_Pause: "KEY_PAUSE",
+    Qt.Key.Key_Print: "KEY_PRINT",
+    Qt.Key.Key_Home: "KEY_HOME",
+    Qt.Key.Key_End: "KEY_END",
+    Qt.Key.Key_Left: "KEY_LEFT",
+    Qt.Key.Key_Up: "KEY_UP",
+    Qt.Key.Key_Right: "KEY_RIGHT",
+    Qt.Key.Key_Down: "KEY_DOWN",
+    Qt.Key.Key_PageUp: "KEY_PAGEUP",
+    Qt.Key.Key_PageDown: "KEY_PAGEDOWN",
+    Qt.Key.Key_CapsLock: "KEY_CAPSLOCK",
+    Qt.Key.Key_NumLock: "KEY_NUMLOCK",
+    Qt.Key.Key_ScrollLock: "KEY_SCROLLLOCK",
+    Qt.Key.Key_Space: "KEY_SPACE",
+    Qt.Key.Key_Minus: "KEY_MINUS",
+    Qt.Key.Key_Equal: "KEY_EQUAL",
+    Qt.Key.Key_BracketLeft: "KEY_LEFTBRACE",
+    Qt.Key.Key_BracketRight: "KEY_RIGHTBRACE",
+    Qt.Key.Key_Semicolon: "KEY_SEMICOLON",
+    Qt.Key.Key_Apostrophe: "KEY_APOSTROPHE",
+    Qt.Key.Key_QuoteLeft: "KEY_GRAVE",
+    Qt.Key.Key_Backslash: "KEY_BACKSLASH",
+    Qt.Key.Key_Comma: "KEY_COMMA",
+    Qt.Key.Key_Period: "KEY_DOT",
+    Qt.Key.Key_Slash: "KEY_SLASH",
+    Qt.Key.Key_VolumeUp: "KEY_VOLUMEUP",
+    Qt.Key.Key_VolumeDown: "KEY_VOLUMEDOWN",
+    Qt.Key.Key_VolumeMute: "KEY_MUTE",
+    Qt.Key.Key_MediaPlay: "KEY_PLAYPAUSE",
+    Qt.Key.Key_MediaPause: "KEY_PLAYPAUSE",
+    Qt.Key.Key_MediaTogglePlayPause: "KEY_PLAYPAUSE",
+    Qt.Key.Key_MediaNext: "KEY_NEXTSONG",
+    Qt.Key.Key_MediaPrevious: "KEY_PREVIOUSSONG",
+    Qt.Key.Key_MediaStop: "KEY_STOPCD",
+    **_QT_MODIFIER_KEYS,
+}
+for _i in range(1, 25):
+    _QT_TO_LINUX_KEY[getattr(Qt.Key, f"Key_F{_i}")] = f"KEY_F{_i}"
+
+
+def _qt_key_to_linux(key: int) -> Optional[str]:
+    if key in _QT_TO_LINUX_KEY:
+        return _QT_TO_LINUX_KEY[key]
+    if Qt.Key.Key_A <= key <= Qt.Key.Key_Z:
+        return f"KEY_{chr(key)}"
+    if Qt.Key.Key_0 <= key <= Qt.Key.Key_9:
+        return f"KEY_{chr(key)}"
+    return None
+
+
+def _qt_modifiers_to_linux(modifiers) -> List[str]:
+    mod_val = int(modifiers.value) if hasattr(modifiers, "value") else int(modifiers)
+    mods: List[str] = []
+    if mod_val & int(Qt.KeyboardModifier.ControlModifier.value):
+        mods.append("KEY_LEFTCTRL")
+    if mod_val & int(Qt.KeyboardModifier.AltModifier.value):
+        mods.append("KEY_LEFTALT")
+    if mod_val & int(Qt.KeyboardModifier.ShiftModifier.value):
+        mods.append("KEY_LEFTSHIFT")
+    if mod_val & int(Qt.KeyboardModifier.MetaModifier.value):
+        mods.append("KEY_LEFTMETA")
+    return mods
 
 
 
@@ -32,6 +118,7 @@ class DeviceManager(QObject):
     testResultChanged = Signal()
     _hidppProfileEvent = Signal(str, int)  # device_key, profile_id
     _hidppDpiEvent = Signal(str, int)  # device_key, dpi
+    _hidInputEvent = Signal(str, str)  # action, detected_name
 
     def __init__(self, parent=None, auto_refresh: bool = True):
         super().__init__(parent)
@@ -50,11 +137,20 @@ class DeviceManager(QObject):
 
         self._hidppProfileEvent.connect(self._on_hidpp_profile_event)
         self._hidppDpiEvent.connect(self._on_hidpp_dpi_event)
+        self._hidInputEvent.connect(self._on_hid_input_event)
 
         # Button tester state
         self._is_testing_button = False
         self._testing_device_id = ""
         self._tested_button_result: Dict[str, Any] = {}
+        self._hid_input_monitor: Optional[hid_input.HidInputMonitor] = None
+        self._pending_qt_mods: List[str] = []
+        self._pending_mod_timer = QTimer(self)
+        self._pending_mod_timer.setSingleShot(True)
+        self._pending_mod_timer.setInterval(int(hid_input.MODIFIER_HOLD_TIMEOUT * 1000))
+        self._pending_mod_timer.timeout.connect(self._on_pending_mod_timeout)
+        self._suppress_qt_until: float = 0.0
+        self._suppress_qt_action: str = ""
         self._test_timer = QTimer(self)
         self._test_timer.setSingleShot(True)
         self._test_timer.setInterval(15000)
@@ -217,6 +313,7 @@ class DeviceManager(QObject):
 
     @Slot()
     def cleanup(self):
+        self._stop_hid_input_monitor()
         with self._monitors_lock:
             for mon in self._hidpp_monitors.values():
                 mon.stop()
@@ -378,18 +475,28 @@ class DeviceManager(QObject):
 
     @Slot(str, int, str, result=bool)
     def remapButton(self, device_id: str, button_idx: int, action: str) -> bool:
+        norm_action, norm_display = parse_button_action(action)
+        dev = self._get_device_by_id(device_id)
+        if dev and dev.buttons:
+            for b in dev.buttons:
+                if b.index == button_idx:
+                    b.action_value = norm_action
+                    b.action_display = norm_display
+                    break
+
         # Update local cache immediately for responsive UI
         for d in self._cached_dict_devices:
             if d["id"] == device_id:
                 for btn in d.get("buttons", []):
                     if btn["index"] == button_idx:
-                        btn["action"] = action
-                        btn["actionDisplay"] = parse_button_action(action)[1]
+                        btn["action"] = norm_action
+                        btn["actionDisplay"] = norm_display
+                        btn["isCustomized"] = bool(
+                            btn.get("defaultAction") and norm_action != btn.get("defaultAction")
+                        )
                         break
                 self.devicesChanged.emit()
                 break
-
-        dev = self._get_device_by_id(device_id)
 
         def _worker():
             for b in self.backends:
@@ -420,126 +527,16 @@ class DeviceManager(QObject):
 
     @Slot(int, int, result="QVariantMap")
     def resolveKeyAction(self, key: int, modifiers: int) -> Dict[str, Any]:
-        mod_val = int(modifiers.value) if hasattr(modifiers, "value") else int(modifiers)
-        has_ctrl = bool(mod_val & int(Qt.KeyboardModifier.ControlModifier.value))
-        has_shift = bool(mod_val & int(Qt.KeyboardModifier.ShiftModifier.value))
-        has_alt = bool(mod_val & int(Qt.KeyboardModifier.AltModifier.value))
-        has_meta = bool(mod_val & int(Qt.KeyboardModifier.MetaModifier.value))
-
-        qt_to_linux = {
-            Qt.Key.Key_Escape: "KEY_ESC",
-            Qt.Key.Key_Tab: "KEY_TAB",
-            Qt.Key.Key_Backtab: "KEY_TAB",
-            Qt.Key.Key_Backspace: "KEY_BACKSPACE",
-            Qt.Key.Key_Return: "KEY_ENTER",
-            Qt.Key.Key_Enter: "KEY_ENTER",
-            Qt.Key.Key_Insert: "KEY_INSERT",
-            Qt.Key.Key_Delete: "KEY_DELETE",
-            Qt.Key.Key_Pause: "KEY_PAUSE",
-            Qt.Key.Key_Print: "KEY_PRINT",
-            Qt.Key.Key_Home: "KEY_HOME",
-            Qt.Key.Key_End: "KEY_END",
-            Qt.Key.Key_Left: "KEY_LEFT",
-            Qt.Key.Key_Up: "KEY_UP",
-            Qt.Key.Key_Right: "KEY_RIGHT",
-            Qt.Key.Key_Down: "KEY_DOWN",
-            Qt.Key.Key_PageUp: "KEY_PAGEUP",
-            Qt.Key.Key_PageDown: "KEY_PAGEDOWN",
-            Qt.Key.Key_Shift: "KEY_LEFTSHIFT",
-            Qt.Key.Key_Control: "KEY_LEFTCTRL",
-            Qt.Key.Key_Meta: "KEY_LEFTMETA",
-            Qt.Key.Key_Alt: "KEY_LEFTALT",
-            Qt.Key.Key_CapsLock: "KEY_CAPSLOCK",
-            Qt.Key.Key_NumLock: "KEY_NUMLOCK",
-            Qt.Key.Key_ScrollLock: "KEY_SCROLLLOCK",
-            Qt.Key.Key_Space: "KEY_SPACE",
-            Qt.Key.Key_VolumeUp: "KEY_VOLUMEUP",
-            Qt.Key.Key_VolumeDown: "KEY_VOLUMEDOWN",
-            Qt.Key.Key_VolumeMute: "KEY_MUTE",
-            Qt.Key.Key_MediaPlay: "KEY_PLAYPAUSE",
-            Qt.Key.Key_MediaPause: "KEY_PLAYPAUSE",
-            Qt.Key.Key_MediaNext: "KEY_NEXTSONG",
-            Qt.Key.Key_MediaPrevious: "KEY_PREVIOUSSONG",
-        }
-        for i in range(1, 25):
-            qt_to_linux[getattr(Qt.Key, f"Key_F{i}")] = f"KEY_F{i}"
-
-        linux_key = None
-        if key in qt_to_linux:
-            linux_key = qt_to_linux[key]
-        elif Qt.Key.Key_A <= key <= Qt.Key.Key_Z:
-            linux_key = f"KEY_{chr(key)}"
-        elif Qt.Key.Key_0 <= key <= Qt.Key.Key_9:
-            linux_key = f"KEY_{chr(key)}"
-
+        linux_key = _qt_key_to_linux(key)
         if not linux_key:
             return {}
 
-        is_mod_key = key in (Qt.Key.Key_Control, Qt.Key.Key_Shift, Qt.Key.Key_Alt, Qt.Key.Key_Meta)
-
-        if not is_mod_key and (has_ctrl or has_alt or has_meta or has_shift):
-            if has_ctrl and not has_alt and not has_meta and not has_shift:
-                if linux_key == "KEY_C":
-                    return {"action": "macro +KEY_LEFTCTRL KEY_C -KEY_LEFTCTRL", "display": "Copy (Ctrl+C)"}
-                if linux_key == "KEY_V":
-                    return {"action": "macro +KEY_LEFTCTRL KEY_V -KEY_LEFTCTRL", "display": "Paste (Ctrl+V)"}
-                if linux_key == "KEY_X":
-                    return {"action": "macro +KEY_LEFTCTRL KEY_X -KEY_LEFTCTRL", "display": "Cut (Ctrl+X)"}
-                if linux_key == "KEY_Z":
-                    return {"action": "macro +KEY_LEFTCTRL KEY_Z -KEY_LEFTCTRL", "display": "Undo (Ctrl+Z)"}
-                if linux_key == "KEY_Y":
-                    return {"action": "macro +KEY_LEFTCTRL KEY_Y -KEY_LEFTCTRL", "display": "Redo (Ctrl+Y)"}
-                if linux_key == "KEY_A":
-                    return {"action": "macro +KEY_LEFTCTRL KEY_A -KEY_LEFTCTRL", "display": "Select All (Ctrl+A)"}
-                if linux_key == "KEY_S":
-                    return {"action": "macro +KEY_LEFTCTRL KEY_S -KEY_LEFTCTRL", "display": "Save (Ctrl+S)"}
-                if linux_key == "KEY_F":
-                    return {"action": "macro +KEY_LEFTCTRL KEY_F -KEY_LEFTCTRL", "display": "Find (Ctrl+F)"}
-                if linux_key == "KEY_T":
-                    return {"action": "macro +KEY_LEFTCTRL KEY_T -KEY_LEFTCTRL", "display": "New Tab (Ctrl+T)"}
-                if linux_key == "KEY_W":
-                    return {"action": "macro +KEY_LEFTCTRL KEY_W -KEY_LEFTCTRL", "display": "Close Tab (Ctrl+W)"}
-            if has_alt and not has_ctrl and not has_shift and not has_meta and linux_key == "KEY_TAB":
-                return {"action": "macro +KEY_LEFTALT KEY_TAB -KEY_LEFTALT", "display": "Switch App (Alt+Tab)"}
-
-            macro_parts = []
-            display_parts = []
-            if has_ctrl:
-                macro_parts.append("+KEY_LEFTCTRL")
-                display_parts.append("Ctrl")
-            if has_alt:
-                macro_parts.append("+KEY_LEFTALT")
-                display_parts.append("Alt")
-            if has_shift:
-                macro_parts.append("+KEY_LEFTSHIFT")
-                display_parts.append("Shift")
-            if has_meta:
-                macro_parts.append("+KEY_LEFTMETA")
-                display_parts.append("Super")
-
-            macro_parts.append(linux_key)
-            k_disp = KEY_DISPLAY_NAMES.get(linux_key, linux_key.replace("KEY_", ""))
-            display_parts.append(k_disp)
-
-            if has_meta:
-                macro_parts.append("-KEY_LEFTMETA")
-            if has_shift:
-                macro_parts.append("-KEY_LEFTSHIFT")
-            if has_alt:
-                macro_parts.append("-KEY_LEFTALT")
-            if has_ctrl:
-                macro_parts.append("-KEY_LEFTCTRL")
-
-            return {
-                "action": "macro " + " ".join(macro_parts),
-                "display": " + ".join(display_parts),
-            }
-
-        k_disp = KEY_DISPLAY_NAMES.get(linux_key, linux_key.replace("KEY_", ""))
-        return {
-            "action": f"key {linux_key}",
-            "display": f"Key: {k_disp}",
-        }
+        if key in _QT_MODIFIER_KEYS:
+            act, disp = format_key_combo([linux_key], None)
+        else:
+            mods = _qt_modifiers_to_linux(modifiers)
+            act, disp = format_key_combo(mods, linux_key)
+        return {"action": act, "display": disp} if act else {}
 
     @Slot(str, str, result=bool)
     def applyProfile(self, device_id: str, profile_name: str) -> bool:
@@ -555,15 +552,25 @@ class DeviceManager(QObject):
 
         # Update local cache immediately
         buttons_data = prof_data.get("buttons", {})
+        if dev.buttons:
+            for b in dev.buttons:
+                idx_str = str(b.index)
+                if idx_str in buttons_data:
+                    norm_act, norm_disp = parse_button_action(buttons_data[idx_str])
+                    b.action_value = norm_act
+                    b.action_display = norm_disp
         for d in self._cached_dict_devices:
             if d["id"] == device_id:
                 d["activeProfile"] = profile_name
                 for btn in d.get("buttons", []):
                     idx_str = str(btn["index"])
                     if idx_str in buttons_data:
-                        act = buttons_data[idx_str]
-                        btn["action"] = act
-                        btn["actionDisplay"] = parse_button_action(act)[1]
+                        norm_act, norm_disp = parse_button_action(buttons_data[idx_str])
+                        btn["action"] = norm_act
+                        btn["actionDisplay"] = norm_disp
+                        btn["isCustomized"] = bool(
+                            btn.get("defaultAction") and norm_act != btn.get("defaultAction")
+                        )
                 if "dpi" in prof_data:
                     d["currentDpi"] = prof_data["dpi"]
                 self.devicesChanged.emit()
@@ -686,17 +693,44 @@ class DeviceManager(QObject):
     def testedButtonResult(self) -> Dict[str, Any]:
         return self._tested_button_result
 
+    def _stop_hid_input_monitor(self):
+        mon = self._hid_input_monitor
+        self._hid_input_monitor = None
+        if mon is not None:
+            mon.stop()
+
+    def _clear_pending_qt_mods(self):
+        self._pending_qt_mods.clear()
+        self._pending_mod_timer.stop()
+
     @Slot(str)
     def startButtonTest(self, device_id: str):
+        self._stop_hid_input_monitor()
+        self._clear_pending_qt_mods()
+        self._suppress_qt_until = 0.0
+        self._suppress_qt_action = ""
         self._is_testing_button = True
         self._testing_device_id = device_id
         self._tested_button_result = {}
         self._test_timer.start(15000)
+
+        dev = self._get_device_by_id(device_id)
+        if dev and dev.usb_vid and dev.usb_pid:
+            mon = hid_input.HidInputMonitor(
+                dev.usb_vid,
+                dev.usb_pid,
+                on_input=lambda act, name: self._hidInputEvent.emit(act, name),
+            )
+            if mon.start():
+                self._hid_input_monitor = mon
+
         self.testResultChanged.emit()
         self.testStateChanged.emit()
 
     @Slot()
     def stopButtonTest(self):
+        self._stop_hid_input_monitor()
+        self._clear_pending_qt_mods()
         if self._is_testing_button:
             self._is_testing_button = False
             self._test_timer.stop()
@@ -708,6 +742,8 @@ class DeviceManager(QObject):
         self.testResultChanged.emit()
 
     def _on_test_timeout(self):
+        self._stop_hid_input_monitor()
+        self._clear_pending_qt_mods()
         if self._is_testing_button:
             self._is_testing_button = False
             self._tested_button_result = {
@@ -720,13 +756,47 @@ class DeviceManager(QObject):
             self.testStateChanged.emit()
             self.testResultChanged.emit()
 
-    def eventFilter(self, watched, event):
+    def _on_pending_mod_timeout(self):
+        if not self._is_testing_button or not self._pending_qt_mods:
+            return
+        mods = list(self._pending_qt_mods)
+        self._clear_pending_qt_mods()
+        action, detected_name = format_key_combo(mods, None)
+        if action and detected_name:
+            self._handle_detected_button(action, detected_name, relaxed_modifiers=True)
+
+    def _on_hid_input_event(self, action: str, detected_name: str):
         if not self._is_testing_button:
+            return
+        self._suppress_qt_until = time.monotonic() + 0.15
+        self._suppress_qt_action = action
+        self._handle_detected_button(action, detected_name, relaxed_modifiers=False)
+
+    def eventFilter(self, watched, event):
+        ev_type = event.type()
+
+        if not self._is_testing_button:
+            if self._suppress_qt_action and time.monotonic() < self._suppress_qt_until:
+                if ev_type == QEvent.Type.MouseButtonPress and self._suppress_qt_action.startswith("button "):
+                    self._suppress_qt_until = 0.0
+                    self._suppress_qt_action = ""
+                    return True
+                if ev_type == QEvent.Type.Wheel and self._suppress_qt_action in (
+                    "special wheel-left",
+                    "special wheel-right",
+                ):
+                    self._suppress_qt_until = 0.0
+                    self._suppress_qt_action = ""
+                    return True
+                if ev_type == QEvent.Type.KeyPress and (
+                    self._suppress_qt_action.startswith("key ") or self._suppress_qt_action.startswith("macro ")
+                ):
+                    return True
             return super().eventFilter(watched, event)
 
-        ev_type = event.type()
         action = None
         detected_name = None
+        relaxed_modifiers = False
 
         if ev_type == QEvent.Type.MouseButtonPress:
             action, detected_name = self._map_mouse_button(event.button())
@@ -741,13 +811,37 @@ class DeviceManager(QObject):
             else:
                 return super().eventFilter(watched, event)
         elif ev_type == QEvent.Type.KeyPress:
-            if event.key() == Qt.Key.Key_Escape:
+            if event.isAutoRepeat():
+                return True
+            key = event.key()
+            mods = _qt_modifiers_to_linux(event.modifiers())
+            if key == Qt.Key.Key_Escape and not mods and not self._pending_qt_mods:
                 self.stopButtonTest()
                 return True
-            action, detected_name = self._map_key_event(event)
+            if key in _QT_MODIFIER_KEYS:
+                mod_name = _QT_MODIFIER_KEYS[key]
+                if mod_name not in self._pending_qt_mods:
+                    self._pending_qt_mods.append(mod_name)
+                self._pending_mod_timer.start()
+                return True
+            merged_mods = list(dict.fromkeys(self._pending_qt_mods + mods))
+            self._clear_pending_qt_mods()
+            action, detected_name = self._map_key_event(event, extra_modifiers=merged_mods)
+            relaxed_modifiers = True
+        elif ev_type == QEvent.Type.KeyRelease:
+            if event.isAutoRepeat():
+                return True
+            if self._pending_qt_mods and event.key() in _QT_MODIFIER_KEYS:
+                released_mod = _QT_MODIFIER_KEYS[event.key()]
+                remaining = [m for m in _qt_modifiers_to_linux(event.modifiers()) if m != released_mod]
+                if not remaining:
+                    mods = list(self._pending_qt_mods)
+                    self._clear_pending_qt_mods()
+                    action, detected_name = format_key_combo(mods, None)
+                    relaxed_modifiers = True
 
         if action and detected_name:
-            self._handle_detected_button(action, detected_name)
+            self._handle_detected_button(action, detected_name, relaxed_modifiers=relaxed_modifiers)
             return True
 
         return super().eventFilter(watched, event)
@@ -779,61 +873,51 @@ class DeviceManager(QObject):
             pass
         return "unknown", "Unknown Mouse Button"
 
-    def _map_key_event(self, event: QKeyEvent) -> Tuple[Optional[str], Optional[str]]:
+    def _map_key_event(
+        self,
+        event: QKeyEvent,
+        extra_modifiers: Optional[List[str]] = None,
+    ) -> Tuple[Optional[str], Optional[str]]:
         key = event.key()
-        qt_key_map = {
-            Qt.Key.Key_MediaPlay: "KEY_PLAYPAUSE",
-            Qt.Key.Key_MediaPause: "KEY_PLAYPAUSE",
-            Qt.Key.Key_MediaTogglePlayPause: "KEY_PLAYPAUSE",
-            Qt.Key.Key_MediaNext: "KEY_NEXTSONG",
-            Qt.Key.Key_MediaPrevious: "KEY_PREVIOUSSONG",
-            Qt.Key.Key_VolumeUp: "KEY_VOLUMEUP",
-            Qt.Key.Key_VolumeDown: "KEY_VOLUMEDOWN",
-            Qt.Key.Key_VolumeMute: "KEY_MUTE",
-            Qt.Key.Key_Return: "KEY_ENTER",
-            Qt.Key.Key_Enter: "KEY_ENTER",
-            Qt.Key.Key_Space: "KEY_SPACE",
-            Qt.Key.Key_Tab: "KEY_TAB",
-            Qt.Key.Key_Backspace: "KEY_BACKSPACE",
-            Qt.Key.Key_Delete: "KEY_DELETE",
-            Qt.Key.Key_Shift: "KEY_LEFTSHIFT",
-            Qt.Key.Key_Control: "KEY_LEFTCTRL",
-            Qt.Key.Key_Alt: "KEY_LEFTALT",
-            Qt.Key.Key_Meta: "KEY_LEFTMETA",
-            Qt.Key.Key_F1: "KEY_F1",
-            Qt.Key.Key_F2: "KEY_F2",
-            Qt.Key.Key_F3: "KEY_F3",
-            Qt.Key.Key_F4: "KEY_F4",
-            Qt.Key.Key_F5: "KEY_F5",
-            Qt.Key.Key_F6: "KEY_F6",
-            Qt.Key.Key_F7: "KEY_F7",
-            Qt.Key.Key_F8: "KEY_F8",
-            Qt.Key.Key_F9: "KEY_F9",
-            Qt.Key.Key_F10: "KEY_F10",
-            Qt.Key.Key_F11: "KEY_F11",
-            Qt.Key.Key_F12: "KEY_F12",
-        }
-        if key in qt_key_map:
-            linux_key = qt_key_map[key]
-            disp = KEY_DISPLAY_NAMES.get(linux_key, linux_key.replace("KEY_", ""))
-            return f"key {linux_key}", f"Key: {disp}"
+        mods = list(dict.fromkeys((extra_modifiers or []) + _qt_modifiers_to_linux(event.modifiers())))
+        linux_key = _qt_key_to_linux(key)
+        if linux_key:
+            if key in _QT_MODIFIER_KEYS:
+                act, disp = format_key_combo([linux_key], None)
+            else:
+                act, disp = format_key_combo(mods, linux_key)
+            return (act, disp) if act else (None, None)
 
         seq = QKeySequence(key).toString()
         if seq:
             clean_k = seq.upper().replace(" ", "_")
-            return f"key KEY_{clean_k}", f"Key: {seq}"
+            fallback_key = f"KEY_{clean_k}"
+            if mods:
+                act, disp = format_key_combo(mods, fallback_key)
+                return (act, disp) if act else (None, None)
+            return f"key {fallback_key}", f"Key: {seq}"
         return None, None
 
-    def _handle_detected_button(self, action: str, detected_name: str):
+    def _handle_detected_button(self, action: str, detected_name: str, relaxed_modifiers: bool = False):
+        self._stop_hid_input_monitor()
+        self._clear_pending_qt_mods()
         dev = self._get_device_by_id(self._testing_device_id)
         matching_indices = []
         matching_names = []
 
         if dev and dev.buttons:
-            for btn in dev.buttons:
-                if btn.action_value == action:
-                    matching_indices.append(btn.index)
-                    matching_names.append(btn.name)
+            exact_matches = [
+                btn for btn in dev.buttons
+                if actions_match(btn.action_value, action, relaxed_modifiers=False)
+            ]
+            matches = exact_matches
+            if not matches and relaxed_modifiers:
+                matches = [
+                    btn for btn in dev.buttons
+                    if actions_match(btn.action_value, action, relaxed_modifiers=True)
+                ]
+            matching_indices = [btn.index for btn in matches]
+            matching_names = [btn.name for btn in matches]
 
         self._tested_button_result = {
             "deviceId": self._testing_device_id,

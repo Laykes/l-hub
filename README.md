@@ -8,7 +8,7 @@ L-Hub provides a unified, native interface to configure gaming mice and headsets
 > **Work in Progress (WIP)**  
 > L-Hub is currently in active early development. Features, UI elements, and internal APIs may change rapidly. Some functions are experimental or partially implemented, and you may encounter bugs or unsupported hardware configurations. Feedback, issue reports, and contributions are very welcome!
 
-![L-Hub screenshot](docs/screenshot.png)
+![L-Hub — Mouse Configuration](docs/screenshot.png)
 
 ---
 
@@ -31,6 +31,16 @@ L-Hub provides a unified, native interface to configure gaming mice and headsets
   - Native KDE Plasma / Kirigami interface following system color schemes and dark/light modes.
   - System tray icon displaying connected device battery levels at a glance.
   - Automatic desktop notifications on low battery warnings (below 20%).
+
+---
+
+## Screenshots
+
+### Headset & Battery Control
+![L-Hub — Headset Control](docs/screenshot-headset.png)
+
+### Button Remapping & Live Key Capture
+![L-Hub — Button Remapping](docs/screenshot-remap.png)
 
 ---
 

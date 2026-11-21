@@ -94,6 +94,24 @@ class TestMouseProfiles(unittest.TestCase):
         self.assertEqual(act, "macro +KEY_LEFTCTRL KEY_V -KEY_LEFTCTRL")
         self.assertEqual(disp, "Paste (Ctrl+V)")
 
+        # Custom multi-modifier macro strips quotes & normalizes ratbagctl arrows
+        act, disp = parse_button_action("macro '↓KEY_LEFTCTRL ↓KEY_LEFTSHIFT ↕KEY_C ↑KEY_LEFTSHIFT ↑KEY_LEFTCTRL'")
+        self.assertEqual(act, "macro +KEY_LEFTCTRL +KEY_LEFTSHIFT KEY_C -KEY_LEFTSHIFT -KEY_LEFTCTRL")
+        self.assertNotIn("Copy", disp)
+
+        # Substring keys like KEY_F5 / KEY_SPACE / KEY_TAB must not match Ctrl+F / Ctrl+S / Ctrl+T
+        act, disp = parse_button_action("macro '↓KEY_LEFTCTRL ↕KEY_F5 ↑KEY_LEFTCTRL'")
+        self.assertEqual(act, "macro +KEY_LEFTCTRL KEY_F5 -KEY_LEFTCTRL")
+        self.assertNotIn("Find", disp)
+
+        act, disp = parse_button_action("macro '↓KEY_LEFTCTRL ↕KEY_SPACE ↑KEY_LEFTCTRL'")
+        self.assertEqual(act, "macro +KEY_LEFTCTRL KEY_SPACE -KEY_LEFTCTRL")
+        self.assertNotIn("Save", disp)
+
+        act, disp = parse_button_action("macro '↓KEY_LEFTCTRL ↕KEY_TAB ↑KEY_LEFTCTRL'")
+        self.assertEqual(act, "macro +KEY_LEFTCTRL KEY_TAB -KEY_LEFTCTRL")
+        self.assertNotIn("New Tab", disp)
+
     def test_button_metadata(self):
         from lhub.backends.ratbag import get_button_metadata
         # Test G502 metadata

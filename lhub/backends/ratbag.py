@@ -54,6 +54,11 @@ KEY_DISPLAY_NAMES: Dict[str, str] = {
     "KEY_LEFTMETA": "Super / Win",
     "KEY_RIGHTMETA": "Right Super",
     "KEY_PRINT": "Screenshot (PrintScreen)",
+    "KEY_SYSRQ": "Screenshot (PrintScreen)",
+    "KEY_PAUSE": "Pause",
+    "KEY_CAPSLOCK": "Caps Lock",
+    "KEY_NUMLOCK": "Num Lock",
+    "KEY_SCROLLLOCK": "Scroll Lock",
     "KEY_VOLUMEUP": "Volume Up",
     "KEY_VOLUMEDOWN": "Volume Down",
     "KEY_MUTE": "Mute",
@@ -66,6 +71,112 @@ for _i in range(1, 25):
     KEY_DISPLAY_NAMES[f"KEY_F{_i}"] = f"F{_i}"
 
 
+MODIFIER_KEYS = frozenset({
+    "KEY_LEFTCTRL",
+    "KEY_RIGHTCTRL",
+    "KEY_LEFTALT",
+    "KEY_RIGHTALT",
+    "KEY_LEFTSHIFT",
+    "KEY_RIGHTSHIFT",
+    "KEY_LEFTMETA",
+    "KEY_RIGHTMETA",
+})
+
+_MODIFIER_SHORT_NAMES: Dict[str, str] = {
+    "KEY_LEFTCTRL": "Ctrl",
+    "KEY_RIGHTCTRL": "Right Ctrl",
+    "KEY_LEFTALT": "Alt",
+    "KEY_RIGHTALT": "Right Alt",
+    "KEY_LEFTSHIFT": "Shift",
+    "KEY_RIGHTSHIFT": "Right Shift",
+    "KEY_LEFTMETA": "Super",
+    "KEY_RIGHTMETA": "Right Super",
+}
+
+_MODIFIER_ORDER: Dict[str, int] = {
+    "KEY_LEFTCTRL": 0,
+    "KEY_RIGHTCTRL": 1,
+    "KEY_LEFTALT": 2,
+    "KEY_RIGHTALT": 3,
+    "KEY_LEFTSHIFT": 4,
+    "KEY_RIGHTSHIFT": 5,
+    "KEY_LEFTMETA": 6,
+    "KEY_RIGHTMETA": 7,
+}
+
+_KEY_ALIASES: Dict[str, str] = {
+    "KEY_SYSRQ": "KEY_PRINT",
+}
+
+_RIGHT_TO_LEFT_MOD: Dict[str, str] = {
+    "KEY_RIGHTCTRL": "KEY_LEFTCTRL",
+    "KEY_RIGHTSHIFT": "KEY_LEFTSHIFT",
+    "KEY_RIGHTALT": "KEY_LEFTALT",
+    "KEY_RIGHTMETA": "KEY_LEFTMETA",
+}
+
+_KNOWN_SHORTCUTS = [
+    (("KEY_LEFTCTRL", "KEY_C"), "Copy (Ctrl+C)", "macro +KEY_LEFTCTRL KEY_C -KEY_LEFTCTRL"),
+    (("KEY_LEFTCTRL", "KEY_V"), "Paste (Ctrl+V)", "macro +KEY_LEFTCTRL KEY_V -KEY_LEFTCTRL"),
+    (("KEY_LEFTCTRL", "KEY_X"), "Cut (Ctrl+X)", "macro +KEY_LEFTCTRL KEY_X -KEY_LEFTCTRL"),
+    (("KEY_LEFTCTRL", "KEY_Z"), "Undo (Ctrl+Z)", "macro +KEY_LEFTCTRL KEY_Z -KEY_LEFTCTRL"),
+    (("KEY_LEFTCTRL", "KEY_Y"), "Redo (Ctrl+Y)", "macro +KEY_LEFTCTRL KEY_Y -KEY_LEFTCTRL"),
+    (("KEY_LEFTCTRL", "KEY_A"), "Select All (Ctrl+A)", "macro +KEY_LEFTCTRL KEY_A -KEY_LEFTCTRL"),
+    (("KEY_LEFTCTRL", "KEY_S"), "Save (Ctrl+S)", "macro +KEY_LEFTCTRL KEY_S -KEY_LEFTCTRL"),
+    (("KEY_LEFTCTRL", "KEY_F"), "Find (Ctrl+F)", "macro +KEY_LEFTCTRL KEY_F -KEY_LEFTCTRL"),
+    (("KEY_LEFTCTRL", "KEY_T"), "New Tab (Ctrl+T)", "macro +KEY_LEFTCTRL KEY_T -KEY_LEFTCTRL"),
+    (("KEY_LEFTCTRL", "KEY_W"), "Close Tab (Ctrl+W)", "macro +KEY_LEFTCTRL KEY_W -KEY_LEFTCTRL"),
+    (("KEY_LEFTALT", "KEY_TAB"), "Switch App (Alt+Tab)", "macro +KEY_LEFTALT KEY_TAB -KEY_LEFTALT"),
+]
+
+
+def format_key_combo(modifiers: List[str], main_key: Optional[str]) -> Tuple[str, str]:
+    """Build canonical (ratbag_action, display_label) for a key or modifier+key combo."""
+    mods = sorted(set(modifiers), key=lambda m: _MODIFIER_ORDER.get(m, 99))
+
+    if main_key is None:
+        if len(mods) == 1:
+            k = mods[0]
+            return f"key {k}", f"Key: {KEY_DISPLAY_NAMES.get(k, k.replace('KEY_', ''))}"
+        if len(mods) > 1:
+            macro_parts = [f"+{m}" for m in mods] + [f"-{m}" for m in reversed(mods)]
+            disp = " + ".join(_MODIFIER_SHORT_NAMES.get(m, m.replace("KEY_", "")) for m in mods)
+            return "macro " + " ".join(macro_parts), disp
+        return "", ""
+
+    if not mods:
+        k_disp = KEY_DISPLAY_NAMES.get(main_key, main_key.replace("KEY_", ""))
+        return f"key {main_key}", f"Key: {k_disp}"
+
+    if len(mods) == 1:
+        for (k1, k2), disp, act in _KNOWN_SHORTCUTS:
+            if mods[0] == k1 and main_key == k2:
+                return act, disp
+
+    macro_parts = [f"+{m}" for m in mods] + [main_key] + [f"-{m}" for m in reversed(mods)]
+    disp_parts = [_MODIFIER_SHORT_NAMES.get(m, m.replace("KEY_", "")) for m in mods]
+    disp_parts.append(KEY_DISPLAY_NAMES.get(main_key, main_key.replace("KEY_", "")))
+    return "macro " + " ".join(macro_parts), " + ".join(disp_parts)
+
+
+def _normalize_macro_tokens(raw: str) -> List[str]:
+    tokens: List[str] = []
+    for tok in raw.split():
+        if tok.startswith("↓"):
+            tokens.append("+" + tok[1:])
+        elif tok.startswith("↑"):
+            tokens.append("-" + tok[1:])
+        elif tok.startswith("↕"):
+            tokens.append(tok[1:])
+        elif tok.startswith("⏱"):
+            tokens.append("t" + tok[1:])
+        elif re.fullmatch(r"\d+ms", tok):
+            tokens.append("t" + tok)
+        else:
+            tokens.append(tok)
+    return tokens
+
+
 def parse_macro(s: str) -> Tuple[str, str]:
     raw = s.strip()
     if raw.startswith("macro"):
@@ -73,36 +184,78 @@ def parse_macro(s: str) -> Tuple[str, str]:
     if raw.startswith("'") and raw.endswith("'"):
         raw = raw[1:-1]
 
-    shortcuts = [
-        (("KEY_LEFTCTRL", "KEY_C"), "Copy (Ctrl+C)", "macro +KEY_LEFTCTRL KEY_C -KEY_LEFTCTRL"),
-        (("KEY_LEFTCTRL", "KEY_V"), "Paste (Ctrl+V)", "macro +KEY_LEFTCTRL KEY_V -KEY_LEFTCTRL"),
-        (("KEY_LEFTCTRL", "KEY_X"), "Cut (Ctrl+X)", "macro +KEY_LEFTCTRL KEY_X -KEY_LEFTCTRL"),
-        (("KEY_LEFTCTRL", "KEY_Z"), "Undo (Ctrl+Z)", "macro +KEY_LEFTCTRL KEY_Z -KEY_LEFTCTRL"),
-        (("KEY_LEFTCTRL", "KEY_Y"), "Redo (Ctrl+Y)", "macro +KEY_LEFTCTRL KEY_Y -KEY_LEFTCTRL"),
-        (("KEY_LEFTCTRL", "KEY_A"), "Select All (Ctrl+A)", "macro +KEY_LEFTCTRL KEY_A -KEY_LEFTCTRL"),
-        (("KEY_LEFTCTRL", "KEY_S"), "Save (Ctrl+S)", "macro +KEY_LEFTCTRL KEY_S -KEY_LEFTCTRL"),
-        (("KEY_LEFTCTRL", "KEY_F"), "Find (Ctrl+F)", "macro +KEY_LEFTCTRL KEY_F -KEY_LEFTCTRL"),
-        (("KEY_LEFTCTRL", "KEY_T"), "New Tab (Ctrl+T)", "macro +KEY_LEFTCTRL KEY_T -KEY_LEFTCTRL"),
-        (("KEY_LEFTCTRL", "KEY_W"), "Close Tab (Ctrl+W)", "macro +KEY_LEFTCTRL KEY_W -KEY_LEFTCTRL"),
-        (("KEY_LEFTALT", "KEY_TAB"), "Switch App (Alt+Tab)", "macro +KEY_LEFTALT KEY_TAB -KEY_LEFTALT"),
-    ]
-    for (k1, k2), disp, act in shortcuts:
-        if k1 in raw and k2 in raw:
-            return act, disp
+    tokens = _normalize_macro_tokens(raw)
+    keys = re.findall(r"KEY_[A-Z0-9_]+", " ".join(tokens))
+    unique_keys = list(dict.fromkeys(keys))
 
-    keys = re.findall(r"KEY_[A-Z0-9]+", raw)
+    if len(unique_keys) == 2:
+        key_set = set(unique_keys)
+        for (k1, k2), disp, act in _KNOWN_SHORTCUTS:
+            if key_set == {k1, k2}:
+                return act, disp
+
     seen = []
-    for k in keys:
+    for k in unique_keys:
         clean = KEY_DISPLAY_NAMES.get(k, k.replace("KEY_LEFT", "").replace("KEY_RIGHT", "").replace("KEY_", ""))
         if clean not in seen:
             seen.append(clean)
     disp = "Macro: " + " + ".join(seen) if seen else "Custom Macro"
-    clean_act = s.strip()
-    if clean_act.startswith("'") and clean_act.endswith("'"):
-        clean_act = clean_act[1:-1]
-    if not clean_act.startswith("macro "):
-        clean_act = f"macro {clean_act}"
+    clean_act = ("macro " + " ".join(tokens)) if tokens else "macro"
     return clean_act, disp
+
+
+def _action_key_signature(
+    action: str,
+    relaxed_modifiers: bool = False,
+) -> Optional[Tuple[frozenset, Tuple[str, ...]]]:
+    act = action.strip()
+    if act.startswith("key "):
+        k = act[4:].strip().strip("'\"")
+        if not k:
+            return None
+        k = _KEY_ALIASES.get(k, k)
+        if relaxed_modifiers:
+            k = _RIGHT_TO_LEFT_MOD.get(k, k)
+        if k in MODIFIER_KEYS:
+            return frozenset({k}), ()
+        return frozenset(), (k,)
+
+    if act.startswith("macro ") or act.startswith("macro'"):
+        norm_act, _ = parse_macro(act)
+        raw = norm_act[6:].strip()
+        mods = set()
+        non_mods: List[str] = []
+        for tok in raw.split():
+            if re.fullmatch(r"t\d+ms", tok):
+                continue
+            is_release = tok.startswith("-")
+            key_name = tok.lstrip("+-")
+            if not key_name.startswith("KEY_"):
+                continue
+            key_name = _KEY_ALIASES.get(key_name, key_name)
+            if relaxed_modifiers:
+                key_name = _RIGHT_TO_LEFT_MOD.get(key_name, key_name)
+            if key_name in MODIFIER_KEYS:
+                if not is_release:
+                    mods.add(key_name)
+            elif not is_release:
+                non_mods.append(key_name)
+        if not mods and not non_mods:
+            return None
+        return frozenset(mods), tuple(non_mods)
+
+    return None
+
+
+def actions_match(configured_action: str, detected_action: str, relaxed_modifiers: bool = False) -> bool:
+    """Return True if a configured button action matches a detected input action."""
+    if not configured_action or not detected_action:
+        return False
+    if configured_action == detected_action:
+        return True
+    sig_a = _action_key_signature(configured_action, relaxed_modifiers=relaxed_modifiers)
+    sig_b = _action_key_signature(detected_action, relaxed_modifiers=relaxed_modifiers)
+    return sig_a is not None and sig_a == sig_b
 
 
 def get_button_metadata(dev_name: str, vid: str, pid: str, b_idx: int, act_val: str, total_buttons: int) -> Dict[str, str]:
