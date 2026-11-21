@@ -1,3 +1,5 @@
+import shutil
+import subprocess
 from pathlib import Path
 
 from PySide6.QtWidgets import QSystemTrayIcon, QMenu, QApplication
@@ -29,6 +31,7 @@ class LHubTray(QObject):
         self.tray.setContextMenu(self.menu)
 
         self.tray.activated.connect(self._on_tray_activated)
+        self.tray.messageClicked.connect(self._show_window)
         self.manager.devicesChanged.connect(self._update_tray)
         self.manager.batteryWarning.connect(self._on_battery_warning)
         self.manager.onboardProfileChanged.connect(self._on_onboard_profile_changed)
@@ -92,8 +95,24 @@ class LHubTray(QObject):
                 tips.append(f"{d['name']}: {' • '.join(parts)}")
         self.tray.setToolTip("\n".join(tips))
 
+    def _notify(self, title: str, message: str, icon=QSystemTrayIcon.Information, timeout_ms: int = 5000):
+        if self.tray.isVisible() and QSystemTrayIcon.supportsMessages():
+            self.tray.showMessage(title, message, icon, timeout_ms)
+            return
+        notify_send = shutil.which("notify-send")
+        if notify_send:
+            urgency = "critical" if icon == QSystemTrayIcon.Critical else "normal"
+            try:
+                subprocess.Popen(
+                    [notify_send, "-a", "L-Hub", "-u", urgency, "-t", str(timeout_ms), title, message],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+            except OSError:
+                pass
+
     def _on_battery_warning(self, name: str, percentage: int):
-        self.tray.showMessage(
+        self._notify(
             "Low Battery",
             f"{name} battery is down to {percentage}%!",
             QSystemTrayIcon.Warning,
@@ -101,7 +120,7 @@ class LHubTray(QObject):
         )
 
     def _on_onboard_profile_changed(self, device_name: str, profile_label: str):
-        self.tray.showMessage(
+        self._notify(
             device_name,
             f"Onboard Profile: {profile_label}",
             QSystemTrayIcon.Information,

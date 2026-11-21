@@ -10,6 +10,7 @@ QQC2.ApplicationWindow {
 
     property string selectedDeviceId: ""
     property string toastMessage: ""
+    property bool toastWarning: false
 
     readonly property var selectedDevice: {
         var devs = deviceManager.devices || []
@@ -30,8 +31,10 @@ QQC2.ApplicationWindow {
     visible: true
     color: theme.bgWindow
 
-    function showToast(msg) {
+    function showToast(msg, isWarning) {
         toastMessage = msg
+        toastWarning = Boolean(isWarning)
+        toastTimer.interval = toastWarning ? 6000 : 3000
         toastTimer.restart()
     }
 
@@ -55,6 +58,10 @@ QQC2.ApplicationWindow {
 
         function onOnboardProfileChanged(deviceName, profileLabel) {
             root.showToast(deviceName + ": " + profileLabel)
+        }
+
+        function onBatteryWarning(deviceName, percentage) {
+            root.showToast("Low battery: " + deviceName + " (" + percentage + "%)", true)
         }
     }
 
@@ -575,7 +582,7 @@ QQC2.ApplicationWindow {
                 opacity: root.toastMessage.length > 0 ? 1.0 : 0.0
                 radius: theme.radiusMd
                 color: theme.bgDialog
-                border.color: theme.accentBorder
+                border.color: root.toastWarning ? theme.dangerBorder : theme.accentBorder
                 border.width: 1
                 implicitWidth: toastRow.implicitWidth + 28
                 implicitHeight: 40
@@ -591,7 +598,7 @@ QQC2.ApplicationWindow {
                         width: 8
                         height: 8
                         radius: 4
-                        color: theme.accent
+                        color: root.toastWarning ? theme.danger : theme.accent
                     }
 
                     Text {

@@ -21,6 +21,9 @@ from .profiles import ProfileManager
 
 
 class DeviceManager(QObject):
+    LOW_BATTERY_THRESHOLD = 20
+    LOW_BATTERY_RESET_THRESHOLD = 25
+
     devicesChanged = Signal()
     statusChanged = Signal()
     batteryWarning = Signal(str, int)  # device_name, percentage
@@ -30,7 +33,7 @@ class DeviceManager(QObject):
     _hidppProfileEvent = Signal(str, int)  # device_key, profile_id
     _hidppDpiEvent = Signal(str, int)  # device_key, dpi
 
-    def __init__(self, parent=None):
+    def __init__(self, parent=None, auto_refresh: bool = True):
         super().__init__(parent)
         self.profile_mgr = ProfileManager()
         self.backends: List[BaseBackend] = [
@@ -64,7 +67,8 @@ class DeviceManager(QObject):
         self._timer.start()
 
         # Initial scan
-        self.refresh_devices()
+        if auto_refresh:
+            self.refresh_devices()
 
     @Slot()
     def refresh_devices(self):
@@ -99,13 +103,7 @@ class DeviceManager(QObject):
 
 
             # Check low battery warnings
-            for d in merged:
-                if d.battery and d.battery.percentage >= 0 and not d.battery.is_charging:
-                    if d.battery.percentage <= 20 and d.id not in self._warned_devices:
-                        self._warned_devices.add(d.id)
-                        self.batteryWarning.emit(d.name, d.battery.percentage)
-                    elif d.battery.percentage > 25 and d.id in self._warned_devices:
-                        self._warned_devices.remove(d.id)
+            self._check_battery_warnings(merged)
 
             dict_devs = [self._device_to_dict(d) for d in merged]
 
@@ -117,6 +115,20 @@ class DeviceManager(QObject):
             self.statusChanged.emit()
         finally:
             self._is_scanning = False
+
+    def _check_battery_warnings(self, devices: List[Device]):
+        for d in devices:
+            if not d.battery or not d.battery.is_supported:
+                continue
+            dev_key = self._get_device_key(d)
+            if d.battery.is_charging:
+                self._warned_devices.discard(dev_key)
+            elif 0 <= d.battery.percentage <= self.LOW_BATTERY_THRESHOLD:
+                if dev_key not in self._warned_devices:
+                    self._warned_devices.add(dev_key)
+                    self.batteryWarning.emit(d.name, d.battery.percentage)
+            elif d.battery.percentage > self.LOW_BATTERY_RESET_THRESHOLD:
+                self._warned_devices.discard(dev_key)
 
     def _sync_hidpp_monitors(self, devices: List[Device]):
         active_keys: Set[str] = set()
@@ -177,6 +189,7 @@ class DeviceManager(QObject):
                         self._hidppDpiEvent.emit(device_key, dpi)
 
                 threading.Thread(target=_read_new_dpi, daemon=True).start()
+            self.refresh_devices()
 
     def _on_hidpp_dpi_event(self, device_key: str, dpi: int):
         updated = False
@@ -719,9 +732,11 @@ class DeviceManager(QObject):
             action, detected_name = self._map_mouse_button(event.button())
         elif ev_type == QEvent.Type.Wheel:
             dx = event.angleDelta().x()
-            if dx < 0:
+            if event.inverted():
+                dx = -dx
+            if dx > 0:
                 action, detected_name = "special wheel-left", "Scroll Wheel Left"
-            elif dx > 0:
+            elif dx < 0:
                 action, detected_name = "special wheel-right", "Scroll Wheel Right"
             else:
                 return super().eventFilter(watched, event)

@@ -215,6 +215,27 @@ class RatbagBackend(BaseBackend):
         self._ctl = shutil.which("ratbagctl")
         self._resolution_maps: Dict[str, Dict[int, int]] = {}
         self._usb_ids: Dict[str, Tuple[str, str]] = {}
+        self._active_profiles: Dict[str, int] = {}
+
+    def _resolve_active_profile(self, device_id: str) -> Tuple[Optional[int], Optional[int]]:
+        """Return (0-based ratbag profile index, 16-bit HID++ profile ID)."""
+        usb_id = self._usb_ids.get(device_id)
+        if usb_id:
+            hw_id = hidpp.get_onboard_profile(*usb_id)
+            hw_idx = hidpp.onboard_profile_index(hw_id)
+            if hw_idx is not None:
+                self._active_profiles[device_id] = hw_idx
+                return hw_idx, hw_id
+        return self._active_profiles.get(device_id), None
+
+    def _finalize_hidpp_commit(self, device_id: str, hidpp_profile_id: Optional[int]) -> None:
+        usb_id = self._usb_ids.get(device_id)
+        if not usb_id or hidpp_profile_id is None:
+            return
+        # ratbagd commits asynchronously over hidraw; wait before sending HID++ traffic
+        # so we don't collide with the flash write, then reload the active profile into RAM.
+        time.sleep(1.5)
+        hidpp.set_onboard_profile(*usb_id, hidpp_profile_id)
 
     def is_available(self) -> bool:
         return self._ctl is not None
@@ -271,8 +292,9 @@ class RatbagBackend(BaseBackend):
             lines = info_res.stdout.splitlines()
             vid, pid = "", ""
             num_buttons = 0
-            has_active_enabled_profile = False
-            active_profile_str = ""
+            profiles: Dict[int, Dict[str, object]] = {}
+            current_prof_idx: Optional[int] = None
+            ratbag_active_idx: Optional[int] = None
 
             for line in lines:
                 line_s = line.strip()
@@ -285,36 +307,58 @@ class RatbagBackend(BaseBackend):
                         num_buttons = int(line_s.split(":", 1)[1].strip())
                     except ValueError:
                         pass
-                elif line_s.startswith("Profile") and "(active)" in line_s:
-                    active_profile_str = line_s
-                    if "(disabled)" not in line_s:
-                        has_active_enabled_profile = True
+                else:
+                    pm = re.match(r"Profile\s+(\d+):", line_s)
+                    if pm:
+                        current_prof_idx = int(pm.group(1))
+                        profiles[current_prof_idx] = {
+                            "disabled": "(disabled)" in line_s,
+                            "lines": [],
+                        }
+                        if "(active)" in line_s:
+                            ratbag_active_idx = current_prof_idx
+                    elif current_prof_idx is not None:
+                        profiles[current_prof_idx]["lines"].append(line_s)
+
             caps = [Capability.PROFILES]
             if vid and pid:
                 self._usb_ids[dev_id] = (vid, pid)
+
+            # ratbagd does not track hardware onboard profile switches; prefer live HID++ profile.
+            onboard_profile_id = hidpp.get_onboard_profile(vid, pid) if (vid and pid) else None
+            onboard_profile = (
+                hidpp.format_onboard_profile(onboard_profile_id)
+                if onboard_profile_id is not None
+                else None
+            )
+            hw_profile_idx = hidpp.onboard_profile_index(onboard_profile_id)
+
+            selected_profile_idx: Optional[int] = None
+            if (
+                hw_profile_idx is not None
+                and hw_profile_idx in profiles
+                and not profiles[hw_profile_idx]["disabled"]
+            ):
+                selected_profile_idx = hw_profile_idx
+            elif (
+                ratbag_active_idx is not None
+                and not profiles[ratbag_active_idx]["disabled"]
+            ):
+                selected_profile_idx = ratbag_active_idx
+
             status_note = ""
             dpi_info = DpiInfo()
             buttons: List[ButtonMapping] = []
 
-            if not has_active_enabled_profile:
+            if selected_profile_idx is None:
                 dpi_info.is_disabled = True
                 status_note = "On-board memory profile disabled"
             else:
+                self._active_profiles[dev_id] = selected_profile_idx
                 caps.extend([Capability.DPI, Capability.BUTTON_REMAP])
-                in_active_profile = False
-                active_profile_lines = []
-                for line in lines:
-                    line_s = line.strip()
-                    if line_s.startswith("Profile ") and "(active)" in line_s:
-                        in_active_profile = True
-                        continue
-                    elif line_s.startswith("Profile ") and in_active_profile:
-                        in_active_profile = False
-                        break
-                    if in_active_profile:
-                        active_profile_lines.append(line_s)
+                active_profile_lines: List[str] = profiles[selected_profile_idx]["lines"]  # type: ignore[assignment]
 
-                dpi_info = self._get_dpi(dev_id, active_profile_lines)
+                dpi_info = self._get_dpi(dev_id, active_profile_lines, profile_idx=selected_profile_idx)
 
                 for line_s in active_profile_lines:
                     if line_s.startswith("Button:"):
@@ -341,15 +385,9 @@ class RatbagBackend(BaseBackend):
                             )
 
                 if not buttons:
-                    buttons = self._get_buttons(dev_id, num_buttons, dev_name, vid, pid)
-
-
-            onboard_profile_id = hidpp.get_onboard_profile(vid, pid) if (vid and pid) else None
-            onboard_profile = (
-                hidpp.format_onboard_profile(onboard_profile_id)
-                if onboard_profile_id is not None
-                else None
-            )
+                    buttons = self._get_buttons(
+                        dev_id, num_buttons, dev_name, vid, pid, profile_idx=selected_profile_idx
+                    )
 
             return Device(
                 id=dev_id,
@@ -369,7 +407,12 @@ class RatbagBackend(BaseBackend):
         except Exception:
             return None
 
-    def _get_dpi(self, dev_id: str, active_profile_lines: Optional[List[str]] = None) -> DpiInfo:
+    def _get_dpi(
+        self,
+        dev_id: str,
+        active_profile_lines: Optional[List[str]] = None,
+        profile_idx: Optional[int] = None,
+    ) -> DpiInfo:
         info = DpiInfo()
         valid_steps: List[int] = []
         current_from_lines: Optional[int] = None
@@ -399,8 +442,9 @@ class RatbagBackend(BaseBackend):
         self._resolution_maps[dev_id] = res_map
 
         try:
+            prof_args = ["profile", str(profile_idx)] if profile_idx is not None else []
             res = subprocess.run(
-                [self._ctl, dev_id, "dpi", "get"],
+                [self._ctl, dev_id] + prof_args + ["dpi", "get"],
                 capture_output=True,
                 text=True,
                 timeout=3,
@@ -436,13 +480,22 @@ class RatbagBackend(BaseBackend):
         info.steps = sorted(list(steps_set))
         return info
 
-    def _get_buttons(self, dev_id: str, count: int, dev_name: str = "", vid: str = "", pid: str = "") -> List[ButtonMapping]:
+    def _get_buttons(
+        self,
+        dev_id: str,
+        count: int,
+        dev_name: str = "",
+        vid: str = "",
+        pid: str = "",
+        profile_idx: Optional[int] = None,
+    ) -> List[ButtonMapping]:
         buttons = []
         max_b = min(12, count if count > 0 else 8)
+        prof_args = ["profile", str(profile_idx)] if profile_idx is not None else []
         for idx in range(max_b):
             try:
                 res = subprocess.run(
-                    [self._ctl, dev_id, "button", str(idx), "action", "get"],
+                    [self._ctl, dev_id] + prof_args + ["button", str(idx), "action", "get"],
                     capture_output=True,
                     text=True,
                     timeout=1,
@@ -524,13 +577,18 @@ class RatbagBackend(BaseBackend):
             parts = action.strip().split()
             if not parts:
                 return False
-            cmd = [self._ctl, device_id, "button", str(button_idx), "action", "set"] + parts
+            profile_idx, hidpp_profile_id = self._resolve_active_profile(device_id)
+            prof_args = ["profile", str(profile_idx)] if profile_idx is not None else []
+            cmd = [self._ctl, device_id] + prof_args + ["button", str(button_idx), "action", "set"] + parts
             res = subprocess.run(
                 cmd,
                 capture_output=True,
-                timeout=3,
+                timeout=8,
             )
-            return res.returncode == 0
+            if res.returncode != 0:
+                return False
+            self._finalize_hidpp_commit(device_id, hidpp_profile_id)
+            return True
         except Exception:
             return False
 
@@ -545,6 +603,9 @@ class RatbagBackend(BaseBackend):
             ]
             if not valid_items:
                 return True
+            profile_idx, hidpp_profile_id = self._resolve_active_profile(device_id)
+            prof_args = ["profile", str(profile_idx)] if profile_idx is not None else []
+            last_ok = False
             for i, (idx, action) in enumerate(valid_items):
                 parts = action.strip().split()
                 if not parts:
@@ -553,9 +614,14 @@ class RatbagBackend(BaseBackend):
                 cmd = [self._ctl]
                 if not is_last:
                     cmd.append("--nocommit")
-                cmd.extend([device_id, "button", str(idx), "action", "set"] + parts)
-                subprocess.run(cmd, capture_output=True, timeout=3)
-                time.sleep(0.04)
+                cmd.extend([device_id] + prof_args + ["button", str(idx), "action", "set"] + parts)
+                res = subprocess.run(cmd, capture_output=True, timeout=8 if is_last else 3)
+                if is_last:
+                    last_ok = (res.returncode == 0)
+                else:
+                    time.sleep(0.04)
+            if last_ok:
+                self._finalize_hidpp_commit(device_id, hidpp_profile_id)
             return True
         except Exception:
             return False

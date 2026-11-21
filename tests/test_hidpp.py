@@ -56,6 +56,69 @@ class TestHidppOnboardProfiles(unittest.TestCase):
         self.assertEqual(hidpp.format_onboard_profile(0x0102), "Profile 2 (Factory)")
         self.assertEqual(hidpp.format_onboard_profile(0x0205), "Profile 0x0205")
 
+    def test_onboard_profile_index(self):
+        self.assertEqual(hidpp.onboard_profile_index(0x0001), 0)
+        self.assertEqual(hidpp.onboard_profile_index(0x0002), 1)
+        self.assertEqual(hidpp.onboard_profile_index(0x0103), 2)
+        self.assertIsNone(hidpp.onboard_profile_index(0x0000))
+        self.assertIsNone(hidpp.onboard_profile_index(0x0201))
+        self.assertIsNone(hidpp.onboard_profile_index(None))
+
+    @patch("lhub.backends.ratbag.hidpp.get_dpi", return_value=1600)
+    @patch("lhub.backends.ratbag.hidpp.get_onboard_profile", return_value=0x0001)
+    @patch("subprocess.run")
+    def test_inspect_device_uses_live_hidpp_profile_over_stale_ratbag_active(
+        self, mock_run, mock_prof, mock_dpi
+    ):
+        info_out = (
+            "chanting-squirrel - Logitech G502 X\n"
+            "             Model: usb:046d:c099:0\n"
+            " Number of Buttons: 11\n"
+            "Profile 0:\n"
+            "  Resolutions:\n"
+            "    0: 1600dpi (active)\n"
+            "  Button: 6 is mapped to 'wheel-left'\n"
+            "Profile 1: (active)\n"
+            "  Resolutions:\n"
+            "    0: 1600dpi (active)\n"
+            "  Button: 6 is mapped to key 'KEY_PLAYPAUSE'\n"
+        )
+        mock_run.side_effect = [
+            MagicMock(returncode=0, stdout=info_out, stderr=""),
+            MagicMock(returncode=0, stdout="1600dpi\n", stderr=""),
+        ]
+        backend = RatbagBackend()
+        backend._ctl = "ratbagctl"
+        dev = backend._inspect_device("chanting-squirrel", "Logitech G502 X")
+        self.assertIsNotNone(dev)
+        self.assertEqual(dev.onboard_profile_id, 0x0001)
+        self.assertEqual(backend._active_profiles["chanting-squirrel"], 0)
+        self.assertEqual(len(dev.buttons), 1)
+        self.assertEqual(dev.buttons[0].action_value, "special wheel-left")
+
+    @patch("lhub.backends.ratbag.time.sleep")
+    @patch("lhub.backends.ratbag.hidpp.set_onboard_profile", return_value=True)
+    @patch("lhub.backends.ratbag.hidpp.get_onboard_profile", return_value=0x0001)
+    @patch("subprocess.run")
+    def test_remap_button_targets_live_hidpp_profile_and_reloads(
+        self, mock_run, mock_get_prof, mock_set_prof, mock_sleep
+    ):
+        mock_run.return_value = MagicMock(returncode=0, stdout="", stderr="")
+        backend = RatbagBackend()
+        backend._ctl = "ratbagctl"
+        backend._usb_ids["mouse"] = ("046d", "c099")
+
+        ok = backend.remap_button("mouse", 6, "key KEY_PLAYPAUSE")
+        self.assertTrue(ok)
+        mock_run.assert_called_once()
+        cmd = mock_run.call_args[0][0]
+        self.assertEqual(
+            cmd,
+            ["ratbagctl", "mouse", "profile", "0", "button", "6", "action", "set", "key", "KEY_PLAYPAUSE"],
+        )
+        mock_sleep.assert_called_once()
+        mock_set_prof.assert_called_once_with("046d", "c099", 0x0001)
+
     def test_parse_onboard_profile_change_events(self):
         # Long report: feature_idx=0x14, event=0, swid=0, profile=0x0002
         long_pkt = bytes([0x11, 0xFF, 0x14, 0x00, 0x00, 0x02]) + bytes(14)
@@ -111,6 +174,7 @@ class TestHidppOnboardProfiles(unittest.TestCase):
         mgr.devicesChanged.connect(lambda: dev_changes.append(True))
 
         # Profile changes from 0x0001 -> 0x0002
+        mock_refresh.reset_mock()
         mgr._on_hidpp_profile_event("046d:c099", 0x0002)
         self.assertEqual(dev.onboard_profile_id, 0x0002)
         self.assertEqual(dev.onboard_profile, "Profile 2")
@@ -118,11 +182,13 @@ class TestHidppOnboardProfiles(unittest.TestCase):
         self.assertTrue(mgr._cached_dict_devices[0]["hasOnboardProfile"])
         self.assertEqual(profile_events, [("Logitech G502 X", "Profile 2")])
         self.assertEqual(len(dev_changes), 1)
+        mock_refresh.assert_called_once()
 
         # Duplicate event for same profile does not re-emit
         mgr._on_hidpp_profile_event("046d:c099", 0x0002)
         self.assertEqual(len(profile_events), 1)
         self.assertEqual(len(dev_changes), 1)
+        mock_refresh.assert_called_once()
 
         # Live DPI update event
         mgr._on_hidpp_dpi_event("046d:c099", 2400)

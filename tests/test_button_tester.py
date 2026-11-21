@@ -31,6 +31,7 @@ class TestButtonTester(unittest.TestCase):
             ButtonMapping(index=8, name="Button 9", action_value="key KEY_PLAYPAUSE", action_display="Key: Play/Pause"),
             ButtonMapping(index=9, name="Button 10", action_value="button 5", action_display="Forward (Button 5)"),
             ButtonMapping(index=10, name="Button 11", action_value="special wheel-left", action_display="Scroll Wheel Left"),
+            ButtonMapping(index=11, name="Button 12", action_value="special wheel-right", action_display="Scroll Wheel Right"),
         ]
         self.test_dev = Device(
             id="test-mouse",
@@ -100,9 +101,27 @@ class TestButtonTester(unittest.TestCase):
         self.assertEqual(res["matchingNames"], ["Button 9"])
 
     def test_detect_wheel_tilt(self):
+        # In Qt, horizontal angleDelta().x() > 0 means scroll/tilt left
         self.manager.startButtonTest("test-mouse")
-        # Horizontal wheel event with negative x delta (tilt left)
-        ev = QWheelEvent(
+        ev_left = QWheelEvent(
+            QPointF(0, 0),
+            QPointF(0, 0),
+            QPoint(0, 0),
+            QPoint(120, 0),
+            Qt.MouseButton.NoButton,
+            Qt.KeyboardModifier.NoModifier,
+            Qt.ScrollPhase.NoScrollPhase,
+            False,
+        )
+        self.assertTrue(self.manager.eventFilter(None, ev_left))
+        res = self.manager.testedButtonResult
+        self.assertEqual(res["action"], "special wheel-left")
+        self.assertEqual(res["matchingIndices"], [10])
+        self.assertEqual(res["matchingNames"], ["Button 11"])
+
+        # angleDelta().x() < 0 means scroll/tilt right
+        self.manager.startButtonTest("test-mouse")
+        ev_right = QWheelEvent(
             QPointF(0, 0),
             QPointF(0, 0),
             QPoint(0, 0),
@@ -112,13 +131,26 @@ class TestButtonTester(unittest.TestCase):
             Qt.ScrollPhase.NoScrollPhase,
             False,
         )
-        handled = self.manager.eventFilter(None, ev)
-        self.assertTrue(handled)
-
+        self.assertTrue(self.manager.eventFilter(None, ev_right))
         res = self.manager.testedButtonResult
-        self.assertEqual(res["action"], "special wheel-left")
-        self.assertEqual(res["matchingIndices"], [10])
-        self.assertEqual(res["matchingNames"], ["Button 11"])
+        self.assertEqual(res["action"], "special wheel-right")
+        self.assertEqual(res["matchingIndices"], [11])
+        self.assertEqual(res["matchingNames"], ["Button 12"])
+
+        # Natural/inverted scroll flips angleDelta(), so inverted=True with -120 is tilt left
+        self.manager.startButtonTest("test-mouse")
+        ev_inverted_left = QWheelEvent(
+            QPointF(0, 0),
+            QPointF(0, 0),
+            QPoint(0, 0),
+            QPoint(-120, 0),
+            Qt.MouseButton.NoButton,
+            Qt.KeyboardModifier.NoModifier,
+            Qt.ScrollPhase.NoScrollPhase,
+            True,
+        )
+        self.assertTrue(self.manager.eventFilter(None, ev_inverted_left))
+        self.assertEqual(self.manager.testedButtonResult["action"], "special wheel-left")
 
     def test_escape_cancels_test(self):
         self.manager.startButtonTest("test-mouse")

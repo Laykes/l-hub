@@ -1,10 +1,13 @@
 import time
 import unittest
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
+
+from PySide6.QtWidgets import QSystemTrayIcon
 
 from lhub.backends.base import Device, DeviceType, Capability, BatteryInfo
 from lhub.backends.headset import HeadsetBackend, _estimate_logitech_charging_percentage
 from lhub.manager import DeviceManager
+from lhub.tray import LHubTray
 
 
 class TestBatteryHandling(unittest.TestCase):
@@ -153,6 +156,118 @@ class TestBatteryHandling(unittest.TestCase):
 
             d_full = manager._device_to_dict(dev_full)
             self.assertEqual(d_full["batteryTimeRemaining"], "Fully charged")
+
+    def _make_battery_device(
+        self,
+        dev_id: str = "headset_046d_0aba",
+        name: str = "Logitech PRO X Wireless",
+        percentage: int = 50,
+        is_charging: bool = False,
+        is_supported: bool = True,
+        vid: str = "046d",
+        pid: str = "0aba",
+    ) -> Device:
+        return Device(
+            id=dev_id,
+            name=name,
+            vendor="Logitech",
+            device_type=DeviceType.HEADSET,
+            usb_vid=vid,
+            usb_pid=pid,
+            capabilities=[Capability.BATTERY],
+            battery=BatteryInfo(
+                percentage=percentage,
+                is_charging=is_charging,
+                is_supported=is_supported,
+            ),
+        )
+
+    def test_low_battery_warning_threshold_and_hysteresis(self):
+        manager = DeviceManager(auto_refresh=False)
+        warnings = []
+        manager.batteryWarning.connect(lambda name, pct: warnings.append((name, pct)))
+
+        # 21% -> no warning
+        manager._check_battery_warnings([self._make_battery_device(percentage=21)])
+        self.assertEqual(warnings, [])
+
+        # 20% -> triggers warning once
+        manager._check_battery_warnings([self._make_battery_device(percentage=20)])
+        self.assertEqual(warnings, [("Logitech PRO X Wireless", 20)])
+
+        # Repeated poll at 19% -> no duplicate
+        manager._check_battery_warnings([self._make_battery_device(percentage=19)])
+        self.assertEqual(len(warnings), 1)
+
+        # Minor fluctuation up to 25% and back to 20% -> hysteresis prevents spam
+        manager._check_battery_warnings([self._make_battery_device(percentage=25)])
+        manager._check_battery_warnings([self._make_battery_device(percentage=20)])
+        self.assertEqual(len(warnings), 1)
+
+        # Above 25% resets warning state; dropping to <= 20% triggers again
+        manager._check_battery_warnings([self._make_battery_device(percentage=26)])
+        manager._check_battery_warnings([self._make_battery_device(percentage=15)])
+        self.assertEqual(
+            warnings,
+            [("Logitech PRO X Wireless", 20), ("Logitech PRO X Wireless", 15)],
+        )
+
+    def test_low_battery_warning_resets_on_charging_and_ignores_invalid(self):
+        manager = DeviceManager(auto_refresh=False)
+        warnings = []
+        manager.batteryWarning.connect(lambda name, pct: warnings.append((name, pct)))
+
+        # Charging at 15%, unsupported, or unknown (-1) must not trigger
+        manager._check_battery_warnings([
+            self._make_battery_device(percentage=15, is_charging=True),
+            self._make_battery_device(dev_id="d2", name="Off Headset", percentage=10, is_supported=False, vid="", pid=""),
+            self._make_battery_device(dev_id="d3", name="Unknown", percentage=-1, vid="", pid=""),
+        ])
+        self.assertEqual(warnings, [])
+
+        # Discharging at 0% triggers
+        manager._check_battery_warnings([self._make_battery_device(percentage=0)])
+        self.assertEqual(warnings, [("Logitech PRO X Wireless", 0)])
+
+        # Plugging into charger resets warned state
+        manager._check_battery_warnings([self._make_battery_device(percentage=-1, is_charging=True)])
+        # Unplugging back at 18% warns again
+        manager._check_battery_warnings([self._make_battery_device(percentage=18, is_charging=False)])
+        self.assertEqual(
+            warnings,
+            [("Logitech PRO X Wireless", 0), ("Logitech PRO X Wireless", 18)],
+        )
+
+    def test_auto_refresh_false_defers_initial_scan(self):
+        with patch.object(DeviceManager, "refresh_devices") as mock_refresh:
+            DeviceManager(auto_refresh=False)
+            mock_refresh.assert_not_called()
+
+    def test_tray_notify_uses_tray_and_falls_back_to_notify_send(self):
+        tray_obj = LHubTray.__new__(LHubTray)
+        tray_obj.tray = MagicMock()
+        tray_obj.tray.isVisible.return_value = True
+
+        with patch.object(QSystemTrayIcon, "supportsMessages", return_value=True):
+            tray_obj._on_battery_warning("Test Headset", 20)
+            tray_obj.tray.showMessage.assert_called_once_with(
+                "Low Battery",
+                "Test Headset battery is down to 20%!",
+                QSystemTrayIcon.Warning,
+                6000,
+            )
+
+        tray_obj.tray.reset_mock()
+        tray_obj.tray.isVisible.return_value = False
+        with patch("lhub.tray.shutil.which", return_value="/usr/bin/notify-send"), \
+             patch("lhub.tray.subprocess.Popen") as mock_popen:
+            tray_obj._on_battery_warning("Test Headset", 15)
+            tray_obj.tray.showMessage.assert_not_called()
+            mock_popen.assert_called_once()
+            cmd = mock_popen.call_args[0][0]
+            self.assertEqual(cmd[0], "/usr/bin/notify-send")
+            self.assertIn("Low Battery", cmd)
+            self.assertIn("Test Headset battery is down to 15%!", cmd)
 
 
 if __name__ == "__main__":

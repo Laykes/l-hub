@@ -6,7 +6,7 @@ from pathlib import Path
 from PySide6.QtWidgets import QApplication
 from PySide6.QtGui import QIcon
 from PySide6.QtQml import QQmlApplicationEngine
-from PySide6.QtCore import QUrl
+from PySide6.QtCore import QUrl, QTimer
 
 from .manager import DeviceManager
 from .tray import LHubTray
@@ -37,7 +37,7 @@ def run():
 
     engine = QQmlApplicationEngine()
 
-    manager = DeviceManager()
+    manager = DeviceManager(auto_refresh=False)
     app.aboutToQuit.connect(manager.cleanup)
     engine.rootContext().setContextProperty("deviceManager", manager)
 
@@ -51,6 +51,7 @@ def run():
     window = engine.rootObjects()[0]
     window.installEventFilter(manager)
     tray = LHubTray(manager, window)
+    QTimer.singleShot(0, manager.refresh_devices)
 
     sys.exit(app.exec())
 

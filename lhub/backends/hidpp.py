@@ -138,6 +138,17 @@ def format_onboard_profile(profile_id: int) -> str:
     return f"Profile 0x{profile_id:04X}"
 
 
+def onboard_profile_index(profile_id: Optional[int]) -> Optional[int]:
+    """Convert a HID++ 0x8100 16-bit profile ID to a 0-based ratbag profile index."""
+    if profile_id is None:
+        return None
+    high = (profile_id >> 8) & 0xFF
+    low = profile_id & 0xFF
+    if high in (0x00, 0x01) and low > 0:
+        return low - 1
+    return None
+
+
 def get_onboard_profile(vid: str, pid: str) -> Optional[int]:
     """Read current onboard profile ID via 0x8100 getCurrentProfile, or None."""
     def action(fd: int, feature_idx: int) -> Optional[int]:
@@ -147,6 +158,14 @@ def get_onboard_profile(vid: str, pid: str) -> Optional[int]:
         profile_id = (data[4] << 8) | data[5]
         return profile_id if profile_id != 0 else None
     return _with_device(vid, pid, _FEATURE_ONBOARD_PROFILES, action)
+
+
+def set_onboard_profile(vid: str, pid: str, profile_id: int) -> bool:
+    """Activate/reload an onboard profile via 0x8100 setCurrentProfile."""
+    def action(fd: int, feature_idx: int) -> bool:
+        data = _request_retry(fd, feature_idx, 3, bytes([(profile_id >> 8) & 0xFF, profile_id & 0xFF]))
+        return data is not None
+    return bool(_with_device(vid, pid, _FEATURE_ONBOARD_PROFILES, action))
 
 
 def parse_onboard_event(data: bytes, feature_idx: int) -> Optional[Tuple[str, int]]:
