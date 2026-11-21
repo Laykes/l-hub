@@ -1,6 +1,5 @@
 import io
 import logging
-import subprocess
 import sys
 import tempfile
 import unittest
@@ -11,6 +10,9 @@ from PySide6.QtGui import QGuiApplication
 
 from lhub.backends import hidpp
 from lhub.backends.base import BaseBackend, Device, DeviceType
+from lhub.backends.dbus_client import DBusCallError, DBusTimeoutError
+from lhub.backends.ratbag import RATBAG_SERVICE
+from lhub.backends.upower import UPOWER_SERVICE
 from lhub.health import (
     HealthCheckItem,
     RATBAGD_FIX_HINT,
@@ -117,59 +119,72 @@ class TestLoggingAndCli(unittest.TestCase):
 
 
 class TestHealthChecks(unittest.TestCase):
-    def test_ratbagd_missing_binary(self):
+    def _make_dbus_client(
+        self,
+        bus_ok=True,
+        owners=None,
+        activatable=None,
+        api_version=2,
+        get_prop_error=None,
+    ):
+        owners = set(owners or ())
+        activatable = set(activatable or ())
+        client = MagicMock()
+        client.is_bus_available.return_value = bus_ok
+        client.has_name_owner.side_effect = lambda svc: svc in owners
+        client.is_service_activatable.side_effect = lambda svc: svc in activatable
+        if get_prop_error is not None:
+            client.get_property.side_effect = get_prop_error
+        else:
+            client.get_property.return_value = api_version
+        return client
+
+    def test_ratbagd_not_installed(self):
+        client = self._make_dbus_client(bus_ok=True, owners=(), activatable=())
         with patch("lhub.health.shutil.which", return_value=None):
-            item = check_ratbagd()
+            item = check_ratbagd(dbus_client=client)
         self.assertEqual(item.id, "ratbagd")
         self.assertEqual(item.severity, SEVERITY_WARNING)
         self.assertTrue(item.is_issue)
         self.assertIn("sudo systemctl enable --now ratbagd", item.fix_hint)
 
-    def test_ratbagd_not_running_even_with_zero_exit_code(self):
-        # Real ratbagctl prints "Unable to connect to ratbagd: ..." to stdout and exits 0.
-        mock_proc = MagicMock(
-            returncode=0,
-            stdout="Unable to connect to ratbagd: No one currently owns org.freedesktop.ratbag1\n",
-            stderr="",
-        )
-        with patch("lhub.health.shutil.which", return_value="/usr/bin/ratbagctl"), \
-             patch("lhub.health.os.access", return_value=True), \
-             patch("lhub.health.subprocess.run", return_value=mock_proc):
-            item = check_ratbagd()
+    def test_ratbagd_installed_but_not_running(self):
+        client = self._make_dbus_client(bus_ok=True, owners=(), activatable={RATBAG_SERVICE})
+        item = check_ratbagd(dbus_client=client)
         self.assertEqual(item.severity, SEVERITY_ERROR)
         self.assertTrue(item.is_issue)
         self.assertEqual(item.fix_hint, RATBAGD_FIX_HINT)
 
-    def test_ratbagd_nonzero_and_timeout(self):
-        with patch("lhub.health.shutil.which", return_value="/usr/bin/ratbagctl"), \
-             patch("lhub.health.os.access", return_value=True), \
-             patch(
-                 "lhub.health.subprocess.run",
-                 return_value=MagicMock(returncode=1, stdout="", stderr="DBus error"),
-             ):
-            err_item = check_ratbagd()
-        self.assertEqual(err_item.severity, SEVERITY_ERROR)
-        self.assertEqual(err_item.fix_hint, RATBAGD_FIX_HINT)
+    def test_ratbagd_bus_unavailable_timeout_and_call_error(self):
+        no_bus = self._make_dbus_client(bus_ok=False)
+        no_bus_item = check_ratbagd(dbus_client=no_bus)
+        self.assertEqual(no_bus_item.severity, SEVERITY_ERROR)
+        self.assertEqual(no_bus_item.fix_hint, RATBAGD_FIX_HINT)
 
-        with patch("lhub.health.shutil.which", return_value="/usr/bin/ratbagctl"), \
-             patch("lhub.health.os.access", return_value=True), \
-             patch("lhub.health.subprocess.run", side_effect=subprocess.TimeoutExpired("ratbagctl", 4)):
-            timeout_item = check_ratbagd()
+        timeout_client = self._make_dbus_client(
+            bus_ok=True,
+            owners={RATBAG_SERVICE},
+            get_prop_error=DBusTimeoutError("timed out"),
+        )
+        timeout_item = check_ratbagd(dbus_client=timeout_client)
         self.assertEqual(timeout_item.severity, SEVERITY_ERROR)
         self.assertEqual(timeout_item.fix_hint, RATBAGD_FIX_HINT)
 
-    def test_ratbagd_running_ok_including_empty_devices(self):
-        for stdout in ("chanting-squirrel: Logitech G502 X\n", "No devices available.\n"):
-            with patch("lhub.health.shutil.which", return_value="/usr/bin/ratbagctl"), \
-                 patch("lhub.health.os.access", return_value=True), \
-                 patch(
-                     "lhub.health.subprocess.run",
-                     return_value=MagicMock(returncode=0, stdout=stdout, stderr=""),
-                 ):
-                item = check_ratbagd()
-            self.assertEqual(item.severity, SEVERITY_OK)
-            self.assertFalse(item.is_issue)
-            self.assertEqual(item.fix_hint, "")
+        err_client = self._make_dbus_client(
+            bus_ok=True,
+            owners={RATBAG_SERVICE},
+            get_prop_error=DBusCallError("org.freedesktop.DBus.Error.AccessDenied", "denied"),
+        )
+        err_item = check_ratbagd(dbus_client=err_client)
+        self.assertEqual(err_item.severity, SEVERITY_ERROR)
+        self.assertEqual(err_item.fix_hint, RATBAGD_FIX_HINT)
+
+    def test_ratbagd_running_ok_via_dbus(self):
+        client = self._make_dbus_client(bus_ok=True, owners={RATBAG_SERVICE}, api_version=2)
+        item = check_ratbagd(dbus_client=client)
+        self.assertEqual(item.severity, SEVERITY_OK)
+        self.assertFalse(item.is_issue)
+        self.assertEqual(item.fix_hint, "")
 
     def test_headsetcontrol_missing_non_executable_and_ok(self):
         with patch("lhub.health.shutil.which", return_value=None):
@@ -260,26 +275,30 @@ class TestHealthChecks(unittest.TestCase):
         m_close.assert_called_once_with(42)
 
     def test_upower_optional_and_all_ok(self):
-        with patch("lhub.health.shutil.which", return_value=None):
-            missing = check_upower()
+        missing_client = self._make_dbus_client(bus_ok=True, owners=(), activatable=())
+        missing = check_upower(dbus_client=missing_client)
         self.assertEqual(missing.severity, SEVERITY_INFO)
         self.assertFalse(missing.is_issue)
 
-        def fake_which(name):
-            return f"/usr/bin/{name}"
+        activatable_client = self._make_dbus_client(bus_ok=True, owners=(), activatable={UPOWER_SERVICE})
+        inactive = check_upower(dbus_client=activatable_client)
+        self.assertEqual(inactive.severity, SEVERITY_INFO)
+        self.assertFalse(inactive.is_issue)
+        self.assertIn("upower", inactive.fix_hint)
 
+        all_ok_client = self._make_dbus_client(
+            bus_ok=True,
+            owners={RATBAG_SERVICE, UPOWER_SERVICE},
+            api_version=2,
+        )
         logi_uevent = "HID_ID=0003:0000046D:0000C099\nHID_NAME=Logitech G502 X\n"
-        with patch("lhub.health.shutil.which", side_effect=fake_which), \
+        with patch("lhub.health.shutil.which", return_value="/usr/bin/headsetcontrol"), \
              patch("lhub.health.os.access", return_value=True), \
-             patch(
-                 "lhub.health.subprocess.run",
-                 return_value=MagicMock(returncode=0, stdout="chanting-squirrel: Logitech G502 X\n", stderr=""),
-             ), \
              patch("lhub.health.glob.glob", return_value=["/sys/class/hidraw/hidraw6"]), \
              patch("builtins.open", mock_open(read_data=logi_uevent)), \
              patch("lhub.health.os.open", return_value=7), \
              patch("lhub.health.os.close"):
-            items = run_health_checks(log_results=False)
+            items = run_health_checks(log_results=False, dbus_client=all_ok_client)
 
         self.assertEqual([i.id for i in items], ["ratbagd", "headsetcontrol", "hidraw", "upower"])
         self.assertTrue(all(i.severity == SEVERITY_OK for i in items))

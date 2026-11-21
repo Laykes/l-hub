@@ -2,11 +2,23 @@ import sys
 import unittest
 import tempfile
 from pathlib import Path
+from unittest.mock import MagicMock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from lhub.profiles import ProfileManager
-from lhub.backends.ratbag import parse_button_action
+from lhub.backends.ratbag import (
+    RATBAG_BUTTON_IFACE,
+    RATBAG_DEVICE_IFACE,
+    RATBAG_SERVICE,
+    RatbagActionSpecial,
+    RatbagActionType,
+    RatbagBackend,
+    RatbagMacroEvent,
+    decode_dbus_button_mapping,
+    encode_dbus_button_mapping,
+    parse_button_action,
+)
 
 
 class TestMouseProfiles(unittest.TestCase):
@@ -123,6 +135,94 @@ class TestMouseProfiles(unittest.TestCase):
         meta0 = get_button_metadata("Logitech G502 X", "046d", "c099", 0, "button 1", 11)
         self.assertIn("Left Click", meta0["name"])
         self.assertEqual(meta0["group"], "main")
+
+    def test_dbus_button_mapping_roundtrip_codecs(self):
+        # NONE
+        enc_none = encode_dbus_button_mapping("disabled")
+        self.assertEqual(enc_none, (int(RatbagActionType.NONE), ("u", 0)))
+        self.assertEqual(decode_dbus_button_mapping(enc_none), ("disabled", "Disabled"))
+
+        # BUTTON
+        enc_btn = encode_dbus_button_mapping("button 4")
+        self.assertEqual(enc_btn, (int(RatbagActionType.BUTTON), ("u", 4)))
+        self.assertEqual(decode_dbus_button_mapping(enc_btn), ("button 4", "Back (Button 4)"))
+
+        # SPECIAL
+        enc_spec = encode_dbus_button_mapping("special resolution-alternate")
+        self.assertEqual(
+            enc_spec,
+            (int(RatbagActionType.SPECIAL), ("u", int(RatbagActionSpecial.RESOLUTION_ALTERNATE))),
+        )
+        self.assertEqual(
+            decode_dbus_button_mapping(enc_spec),
+            ("special resolution-alternate", "DPI Shift (Sniper)"),
+        )
+
+        # KEY
+        enc_key = encode_dbus_button_mapping("key KEY_SPACE")
+        self.assertEqual(enc_key, (int(RatbagActionType.KEY), ("u", 57)))
+        self.assertEqual(decode_dbus_button_mapping(enc_key), ("key KEY_SPACE", "Key: Space"))
+
+        # MACRO with press/release + wait
+        enc_macro = encode_dbus_button_mapping("macro +KEY_LEFTCTRL KEY_C t10ms -KEY_LEFTCTRL")
+        self.assertEqual(
+            enc_macro,
+            (
+                int(RatbagActionType.MACRO),
+                (
+                    "a(uu)",
+                    [
+                        (int(RatbagMacroEvent.KEY_PRESS), 29),
+                        (int(RatbagMacroEvent.KEY_PRESS), 46),
+                        (int(RatbagMacroEvent.KEY_RELEASE), 46),
+                        (int(RatbagMacroEvent.WAIT), 10),
+                        (int(RatbagMacroEvent.KEY_RELEASE), 29),
+                    ],
+                ),
+            ),
+        )
+        act, disp = decode_dbus_button_mapping(enc_macro)
+        self.assertEqual(act, "macro +KEY_LEFTCTRL KEY_C -KEY_LEFTCTRL")
+        self.assertEqual(disp, "Copy (Ctrl+C)")
+
+    def test_batch_remap_buttons_commits_once_via_dbus(self):
+        dev_path = "/org/freedesktop/ratbag1/device/mouse"
+        dbus = MagicMock()
+        dbus.is_bus_available.return_value = True
+        dbus.has_name_owner.return_value = True
+        dbus.call_method.return_value = (0,)
+
+        backend = RatbagBackend(dbus_client=dbus)
+        backend._device_paths["mouse"] = dev_path
+        backend._active_profiles["mouse"] = 0
+        backend._profile_paths["mouse"] = {0: "/org/freedesktop/ratbag1/profile/mouse/p0"}
+        backend._resolution_paths["mouse"] = {0: {}}
+        backend._resolution_is_xy["mouse"] = {0: {}}
+        backend._button_paths["mouse"] = {
+            0: {
+                3: "/org/freedesktop/ratbag1/button/mouse/p0/b3",
+                4: "/org/freedesktop/ratbag1/button/mouse/p0/b4",
+            }
+        }
+
+        ok = backend.batch_remap_buttons(
+            "mouse",
+            {
+                3: "key KEY_F5",
+                4: "macro +KEY_LEFTCTRL KEY_C -KEY_LEFTCTRL",
+            },
+        )
+        self.assertTrue(ok)
+        self.assertEqual(dbus.set_property.call_count, 2)
+        dbus.set_property.assert_any_call(
+            RATBAG_SERVICE,
+            "/org/freedesktop/ratbag1/button/mouse/p0/b3",
+            RATBAG_BUTTON_IFACE,
+            "Mapping",
+            "(uv)",
+            (int(RatbagActionType.KEY), ("u", 63)),
+        )
+        dbus.call_method.assert_called_once_with(RATBAG_SERVICE, dev_path, RATBAG_DEVICE_IFACE, "Commit")
 
 
 if __name__ == "__main__":

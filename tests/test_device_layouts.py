@@ -13,6 +13,14 @@ from PySide6.QtGui import QGuiApplication
 
 from lhub.backends.base import ButtonMapping, Capability, Device, DeviceType, DpiInfo
 from lhub.backends.ratbag import (
+    RATBAG_BUTTON_IFACE,
+    RATBAG_DEVICE_IFACE,
+    RATBAG_MANAGER_IFACE,
+    RATBAG_MANAGER_PATH,
+    RATBAG_PROFILE_IFACE,
+    RATBAG_RESOLUTION_IFACE,
+    RatbagActionSpecial,
+    RatbagActionType,
     RatbagBackend,
     get_button_metadata as ratbag_get_button_metadata,
     parse_button_action,
@@ -475,77 +483,104 @@ class TestRatbagAndManagerIntegration(unittest.TestCase):
     @patch("lhub.backends.ratbag.hidpp.set_onboard_profile", return_value=True)
     @patch("lhub.backends.ratbag.hidpp.get_onboard_profile", return_value=None)
     @patch("lhub.backends.ratbag.hidpp.get_dpi", return_value=None)
-    @patch("subprocess.run")
     def test_ratbag_reset_defaults_uses_layout_or_safe_fallback(
-        self, mock_run, mock_dpi, mock_get_prof, mock_set_prof, mock_set_dpi, mock_sleep
+        self, mock_dpi, mock_get_prof, mock_set_prof, mock_set_dpi, mock_sleep
     ):
-        def _build_info(title, vid, pid, count):
-            lines = [
-                f"dev0 - {title}",
-                f"             Model: usb:{vid}:{pid}:0",
-                f" Number of Buttons: {count}",
-                "Profile 0:",
-                "  Resolutions:",
-                "    0: 800dpi (active)",
-                "  Button: 0 is mapped to 'button 1'",
-                "Profile 1: (active)",
-                "  Resolutions:",
-                "    0: 800dpi (active)",
-                "    1: 1600dpi",
-            ]
-            for i in range(count):
-                lines.append(f"  Button: {i} is mapped to 'key KEY_A'")
-            return "\n".join(lines) + "\n"
+        def _build_props_map(title, vid, pid, count):
+            dev_path = "/org/freedesktop/ratbag1/device/dev0"
+            p0 = "/org/freedesktop/ratbag1/profile/dev0/p0"
+            p1 = "/org/freedesktop/ratbag1/profile/dev0/p1"
+            p0_buttons = [f"/org/freedesktop/ratbag1/button/dev0/p0/b{i}" for i in range(count)]
+            p1_buttons = [f"/org/freedesktop/ratbag1/button/dev0/p1/b{i}" for i in range(count)]
+            props = {
+                (RATBAG_MANAGER_PATH, RATBAG_MANAGER_IFACE): {"Devices": [dev_path]},
+                (dev_path, RATBAG_DEVICE_IFACE): {
+                    "Name": title,
+                    "Model": f"usb:{vid}:{pid}:0",
+                    "DeviceType": 2,
+                    "Profiles": [p0, p1],
+                },
+                (p0, RATBAG_PROFILE_IFACE): {
+                    "Index": 0,
+                    "Disabled": False,
+                    "IsActive": False,
+                    "Resolutions": ["/r0"],
+                    "Buttons": p0_buttons,
+                },
+                (p1, RATBAG_PROFILE_IFACE): {
+                    "Index": 1,
+                    "Disabled": False,
+                    "IsActive": True,
+                    "Resolutions": ["/r1_0", "/r1_1"],
+                    "Buttons": p1_buttons,
+                },
+                ("/r0", RATBAG_RESOLUTION_IFACE): {"Index": 0, "Resolution": ("u", 800), "IsActive": True},
+                ("/r1_0", RATBAG_RESOLUTION_IFACE): {"Index": 0, "Resolution": ("u", 800), "IsActive": True},
+                ("/r1_1", RATBAG_RESOLUTION_IFACE): {"Index": 1, "Resolution": ("u", 1600), "IsActive": False},
+            }
+            for i, bp in enumerate(p0_buttons):
+                props[(bp, RATBAG_BUTTON_IFACE)] = {
+                    "Index": i,
+                    "Mapping": (int(RatbagActionType.BUTTON), ("u", 1))
+                    if i == 0
+                    else (int(RatbagActionType.KEY), ("u", 30)),
+                }
+            for i, bp in enumerate(p1_buttons):
+                props[(bp, RATBAG_BUTTON_IFACE)] = {
+                    "Index": i,
+                    "Mapping": (int(RatbagActionType.KEY), ("u", 30)),
+                }
+            return props
 
-        def _extract_profile_button_cmds(calls, prof_str):
+        def _make_fake_dbus(props_map):
+            dbus = MagicMock()
+            dbus.is_bus_available.return_value = True
+            dbus.has_name_owner.return_value = True
+            dbus.get_all_properties.side_effect = lambda svc, path, iface: dict(props_map.get((path, iface), {}))
+            dbus.get_property.side_effect = lambda svc, path, iface, prop: props_map.get((path, iface), {}).get(prop)
+            dbus.call_method.return_value = (0,)
+            return dbus
+
+        def _extract_profile_button_writes(calls, prof_str):
             out = []
             for call in calls:
-                cmd = call[0][0]
-                if len(cmd) >= 7 and cmd[1] == "--nocommit" and cmd[3:6] == ["profile", prof_str, "button"]:
-                    out.append((cmd[6], cmd[9:]))
-                elif len(cmd) >= 6 and cmd[2:5] == ["profile", prof_str, "button"]:
-                    out.append((cmd[5], cmd[8:]))
+                _svc, path, iface, prop, _sig, val = call[0]
+                if iface == RATBAG_BUTTON_IFACE and prop == "Mapping" and f"/{prof_str}/" in path:
+                    btn_idx = path.rsplit("/b", 1)[-1]
+                    out.append((btn_idx, val))
             return out
 
         # Case 1: Known Logitech G502 X -> resets all 11 G502 defaults
-        g502_info = _build_info("Logitech G502 X", "046d", "c099", 11)
-        mock_run.side_effect = [
-            MagicMock(returncode=0, stdout="", stderr=""),  # profile 1 enable
-            MagicMock(returncode=0, stdout=g502_info, stderr=""),  # info
-            MagicMock(returncode=0, stdout="800dpi\n", stderr=""),  # dpi get
-        ] + [MagicMock(returncode=0, stdout="", stderr="")] * 30
+        dbus1 = _make_fake_dbus(_build_props_map("Logitech G502 X", "046d", "c099", 11))
+        backend = RatbagBackend(dbus_client=dbus1)
+        self.assertTrue(backend.reset_defaults("ratbag_dev0"))
 
-        backend = RatbagBackend()
-        backend._ctl = "ratbagctl"
-        self.assertTrue(backend.reset_defaults("dev0"))
+        prof1_writes = _extract_profile_button_writes(dbus1.set_property.call_args_list, "p1")
+        self.assertEqual([idx for idx, _ in prof1_writes], [str(i) for i in range(11)])
+        self.assertEqual(
+            prof1_writes[4][1],
+            (int(RatbagActionType.SPECIAL), ("u", int(RatbagActionSpecial.RESOLUTION_ALTERNATE))),
+        )
 
-        prof1_cmds = _extract_profile_button_cmds(mock_run.call_args_list, "1")
-        self.assertEqual([idx for idx, _ in prof1_cmds], [str(i) for i in range(11)])
-        self.assertEqual(prof1_cmds[4][1], ["special", "resolution-alternate"])
-
-        prof0_cmds = _extract_profile_button_cmds(mock_run.call_args_list, "0")
-        self.assertEqual([idx for idx, _ in prof0_cmds], [str(i) for i in range(11)])
-        self.assertEqual(prof0_cmds[4][1], ["special", "resolution-alternate"])
+        prof0_writes = _extract_profile_button_writes(dbus1.set_property.call_args_list, "p0")
+        self.assertEqual([idx for idx, _ in prof0_writes], [str(i) for i in range(11)])
+        self.assertEqual(
+            prof0_writes[4][1],
+            (int(RatbagActionType.SPECIAL), ("u", int(RatbagActionSpecial.RESOLUTION_ALTERNATE))),
+        )
 
         # Case 2: Unknown 11-button mouse -> resets only safe standard buttons 0..3
-        mock_run.reset_mock()
-        unknown_info = _build_info("Mystery 11-Button Mouse", "1234", "5678", 11)
-        mock_run.side_effect = [
-            MagicMock(returncode=0, stdout="", stderr=""),  # profile 1 enable
-            MagicMock(returncode=0, stdout=unknown_info, stderr=""),  # info
-            MagicMock(returncode=0, stdout="800dpi\n", stderr=""),  # dpi get
-        ] + [MagicMock(returncode=0, stdout="", stderr="")] * 20
-
-        self.assertTrue(backend.reset_defaults("dev0"))
-        prof1_unknown = _extract_profile_button_cmds(mock_run.call_args_list, "1")
+        dbus2 = _make_fake_dbus(_build_props_map("Mystery 11-Button Mouse", "1234", "5678", 11))
+        backend2 = RatbagBackend(dbus_client=dbus2)
+        self.assertTrue(backend2.reset_defaults("ratbag_dev0"))
+        prof1_unknown = _extract_profile_button_writes(dbus2.set_property.call_args_list, "p1")
         self.assertEqual([idx for idx, _ in prof1_unknown], ["0", "1", "2", "3"])
-        prof0_unknown = _extract_profile_button_cmds(mock_run.call_args_list, "0")
+        prof0_unknown = _extract_profile_button_writes(dbus2.set_property.call_args_list, "p0")
         self.assertEqual([idx for idx, _ in prof0_unknown], ["0", "1", "2", "3"])
 
     @patch("lhub.backends.ratbag.hidpp.get_onboard_profile", return_value=None)
     @patch("lhub.backends.ratbag.hidpp.get_dpi", return_value=None)
-    @patch("subprocess.run")
-    def test_inspect_device_parses_name_and_uses_layout_vendor(self, mock_run, mock_dpi, mock_prof):
+    def test_inspect_device_parses_name_and_uses_layout_vendor(self, mock_dpi, mock_prof):
         with tempfile.TemporaryDirectory() as xdg_dir:
             devices_dir = Path(xdg_dir) / "lhub" / "devices"
             devices_dir.mkdir(parents=True)
@@ -559,26 +594,35 @@ class TestRatbagAndManagerIntegration(unittest.TestCase):
             )
             (devices_dir / "custom.json").write_text(json.dumps(custom), encoding="utf-8")
 
-            info_out = (
-                "dev0 - Custom Vendor Mouse\n"
-                "             Model: usb:1234:5678:0\n"
-                " Number of Buttons: 2\n"
-                "Profile 0: (active)\n"
-                "  Resolutions:\n"
-                "    0: 800dpi (active)\n"
-                "  Button: 0 is mapped to 'button 1'\n"
-                "  Button: 1 is mapped to 'button 2'\n"
-            )
-            mock_run.side_effect = [
-                MagicMock(returncode=0, stdout=info_out, stderr=""),
-                MagicMock(returncode=0, stdout="800dpi\n", stderr=""),
-            ]
+            dev_path = "/org/freedesktop/ratbag1/device/dev0"
+            p0 = "/org/freedesktop/ratbag1/profile/dev0/p0"
+            props_map = {
+                (dev_path, RATBAG_DEVICE_IFACE): {
+                    "Name": "Custom Vendor Mouse",
+                    "Model": "usb:1234:5678:0",
+                    "DeviceType": 2,
+                    "Profiles": [p0],
+                },
+                (p0, RATBAG_PROFILE_IFACE): {
+                    "Index": 0,
+                    "Disabled": False,
+                    "IsActive": True,
+                    "Resolutions": ["/r0"],
+                    "Buttons": ["/b0", "/b1"],
+                },
+                ("/r0", RATBAG_RESOLUTION_IFACE): {"Index": 0, "Resolution": ("u", 800), "IsActive": True},
+                ("/b0", RATBAG_BUTTON_IFACE): {"Index": 0, "Mapping": (int(RatbagActionType.BUTTON), ("u", 1))},
+                ("/b1", RATBAG_BUTTON_IFACE): {"Index": 1, "Mapping": (int(RatbagActionType.BUTTON), ("u", 2))},
+            }
+            dbus = MagicMock()
+            dbus.is_bus_available.return_value = True
+            dbus.has_name_owner.return_value = True
+            dbus.get_all_properties.side_effect = lambda svc, path, iface: dict(props_map.get((path, iface), {}))
 
             with patch.dict(os.environ, {"XDG_CONFIG_HOME": xdg_dir}):
                 reload_layouts()
-                backend = RatbagBackend()
-                backend._ctl = "ratbagctl"
-                dev = backend._inspect_device("dev0", "")
+                backend = RatbagBackend(dbus_client=dbus)
+                dev = backend._inspect_device("ratbag_dev0", dev_path)
                 self.assertIsNotNone(dev)
                 self.assertEqual(dev.name, "Custom Vendor Mouse")
                 self.assertEqual(dev.vendor, "CustomVendor")

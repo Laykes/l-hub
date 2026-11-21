@@ -1,5 +1,6 @@
 """Device coordinator bridging hardware backends, profiles, health checks, and QML."""
 
+from dataclasses import replace
 import logging
 import threading
 from typing import Any, Dict, List, Optional, Set, Tuple
@@ -38,6 +39,8 @@ class DeviceManager(QObject):
 
     LOW_BATTERY_THRESHOLD = 20
     LOW_BATTERY_RESET_THRESHOLD = 25
+    HOTPLUG_DEBOUNCE_MS = 400
+    FALLBACK_POLL_INTERVAL_MS = 30000
 
     devicesChanged = Signal()
     statusChanged = Signal()
@@ -48,60 +51,147 @@ class DeviceManager(QObject):
     testResultChanged = Signal()
     _hidppProfileEvent = Signal(str, int)  # device_key, profile_id
     _hidppDpiEvent = Signal(str, int)  # device_key, dpi
+    _backendEvent = Signal(str)  # backend_name
+    _scanFinished = Signal()
 
-    def __init__(self, parent=None, auto_refresh: bool = True):
+    def __init__(
+        self,
+        parent=None,
+        auto_refresh: bool = True,
+        backends: Optional[List[BaseBackend]] = None,
+        enable_hotplug: bool = True,
+    ):
         super().__init__(parent)
         self.profile_mgr = ProfileManager()
-        self.backends: List[BaseBackend] = [
-            HeadsetBackend(),
-            RatbagBackend(),
-            UPowerBackend(),
-        ]
+        self.backends: List[BaseBackend] = (
+            list(backends)
+            if backends is not None
+            else [
+                HeadsetBackend(),
+                RatbagBackend(),
+                UPowerBackend(),
+            ]
+        )
         self._devices: List[Device] = []
         self._cached_dict_devices: List[Dict[str, Any]] = []
+        self._backend_devices: Dict[str, List[Device]] = {}
+        self._monitored_backends: List[BaseBackend] = []
         self._health_checks: List[Dict[str, Any]] = []
         self._last_health_signature: Optional[Tuple[Tuple[str, str, str, str], ...]] = None
         self._is_scanning = False
+        self._pending_refresh = False
         self._warned_devices: Set[str] = set()
         self._hidpp_monitors: Dict[str, hidpp.OnboardProfileMonitor] = {}
         self._monitors_lock = threading.Lock()
 
         self._hidppProfileEvent.connect(self._on_hidpp_profile_event)
         self._hidppDpiEvent.connect(self._on_hidpp_dpi_event)
+        self._backendEvent.connect(self._on_backend_event)
+        self._scanFinished.connect(self._on_scan_finished)
 
         self._button_tester = ButtonTesterController(self._get_device_by_id, parent=self)
         self._button_tester.testStateChanged.connect(self.testStateChanged.emit)
         self._button_tester.testResultChanged.connect(self.testResultChanged.emit)
 
-        # Background refresh timer every 30 seconds
+        self._hotplug_debounce_timer = QTimer(self)
+        self._hotplug_debounce_timer.setSingleShot(True)
+        self._hotplug_debounce_timer.setInterval(self.HOTPLUG_DEBOUNCE_MS)
+        self._hotplug_debounce_timer.timeout.connect(self._on_hotplug_debounce_timeout)
+
+        if enable_hotplug:
+            self._start_backend_monitors()
+
+        # Lightweight fallback polling timer for non-hotplug CLI backends (e.g. headsetcontrol)
         self._timer = QTimer(self)
-        self._timer.setInterval(30000)
-        self._timer.timeout.connect(self.refresh_devices)
+        self._timer.setInterval(self.FALLBACK_POLL_INTERVAL_MS)
+        self._timer.timeout.connect(self._on_poll_timeout)
         self._timer.start()
 
         # Initial scan
         if auto_refresh:
             self.refresh_devices()
 
-    @Slot()
-    def refresh_devices(self):
+    def _start_backend_monitors(self) -> None:
+        self._stop_backend_monitors()
+        for backend in self.backends:
+            if not backend.supports_hotplug:
+                continue
+            try:
+                started = backend.start_monitoring(
+                    lambda name=backend.name: self._backendEvent.emit(name)
+                )
+            except Exception as exc:
+                logger.warning("Failed to start hotplug monitoring on %s: %s", backend.name, exc)
+                started = False
+            if started:
+                self._monitored_backends.append(backend)
+                logger.debug("Hotplug monitoring active for backend %s", backend.name)
+
+    def _stop_backend_monitors(self) -> None:
+        for backend in self._monitored_backends:
+            try:
+                backend.stop_monitoring()
+            except Exception as exc:
+                logger.debug("Failed to stop hotplug monitoring on %s: %s", backend.name, exc)
+        self._monitored_backends.clear()
+
+    def _on_backend_event(self, backend_name: str) -> None:
+        logger.debug("Hotplug/property change event received from %s", backend_name)
+        self._hotplug_debounce_timer.start()
+
+    def _on_hotplug_debounce_timeout(self) -> None:
+        if self._is_scanning:
+            self._pending_refresh = True
+            return
+        self.refresh_devices()
+
+    def _on_scan_finished(self) -> None:
+        if self._pending_refresh:
+            self._pending_refresh = False
+            self._hotplug_debounce_timer.start()
+
+    def _get_polling_backends(self) -> List[BaseBackend]:
+        monitored_ids = {id(b) for b in self._monitored_backends}
+        return [
+            b
+            for b in self.backends
+            if b.is_available() and (not b.supports_hotplug or id(b) not in monitored_ids)
+        ]
+
+    def _on_poll_timeout(self) -> None:
+        polling_backends = self._get_polling_backends()
+        if not polling_backends:
+            logger.debug("Skipping fallback poll: all active backends use hotplug events")
+            return
+        self._start_scan(backends_to_scan=polling_backends)
+
+    def _start_scan(self, backends_to_scan: Optional[List[BaseBackend]] = None) -> None:
         if self._is_scanning:
             return
         self._is_scanning = True
 
         # Run scan in background thread to avoid freezing GUI
-        thread = threading.Thread(target=self._scan_worker, daemon=True)
+        thread = threading.Thread(
+            target=self._scan_worker,
+            args=(backends_to_scan,),
+            daemon=True,
+        )
         thread.start()
 
-    def _scan_worker(self):
+    @Slot()
+    def refresh_devices(self):
+        self._start_scan(backends_to_scan=None)
+
+    def _scan_worker(self, backends_to_scan: Optional[List[BaseBackend]] = None):
         try:
-            detected: List[Device] = []
-            for b in self.backends:
+            targets = list(self.backends) if backends_to_scan is None else list(backends_to_scan)
+            for b in targets:
                 if b.is_available():
                     try:
                         devs = b.scan_devices()
-                        detected.extend(devs)
+                        self._backend_devices[b.name] = list(devs)
                     except Exception as exc:
+                        self._backend_devices[b.name] = []
                         logger.warning(
                             "Backend %s scan failed: %s",
                             b.name,
@@ -109,7 +199,13 @@ class DeviceManager(QObject):
                             exc_info=logger.isEnabledFor(logging.DEBUG),
                         )
                 else:
+                    self._backend_devices[b.name] = []
                     logger.debug("Backend %s unavailable: %s", b.name, b.get_missing_reason() or "not found")
+
+            detected: List[Device] = []
+            for b in self.backends:
+                for dev in self._backend_devices.get(b.name, ()):
+                    detected.append(replace(dev))
 
             merged = self._merge_devices(detected)
 
@@ -136,6 +232,7 @@ class DeviceManager(QObject):
             self.statusChanged.emit()
         finally:
             self._is_scanning = False
+            self._scanFinished.emit()
 
     def _check_battery_warnings(self, devices: List[Device]):
         for d in devices:
@@ -240,6 +337,10 @@ class DeviceManager(QObject):
 
     @Slot()
     def cleanup(self):
+        self._timer.stop()
+        self._hotplug_debounce_timer.stop()
+        self._pending_refresh = False
+        self._stop_backend_monitors()
         self._button_tester.cleanup()
         with self._monitors_lock:
             for mon in self._hidpp_monitors.values():
