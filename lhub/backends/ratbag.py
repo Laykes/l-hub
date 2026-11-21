@@ -577,9 +577,17 @@ class RatbagBackend(BaseBackend):
         self._button_paths: Dict[str, Dict[int, Dict[int, str]]] = {}
         self._resolution_maps: Dict[str, Dict[int, int]] = {}
         self._usb_ids: Dict[str, Tuple[str, str]] = {}
+        self._device_names: Dict[str, str] = {}
         self._active_profiles: Dict[str, int] = {}
         self._subscription_ids: List[int] = []
         self._activation_failed: bool = False
+
+    def _hidpp_kwargs(self, device_id: str) -> Dict[str, Any]:
+        with self._topology_lock:
+            dev_name = self._device_names.get(device_id)
+        if dev_name:
+            return {"device_name": dev_name, "device_key": device_id}
+        return {}
 
     def _resolve_active_profile(self, device_id: str) -> Tuple[Optional[int], Optional[int]]:
         """Return (0-based ratbag profile index, 16-bit HID++ profile ID)."""
@@ -587,7 +595,7 @@ class RatbagBackend(BaseBackend):
             usb_id = self._usb_ids.get(device_id)
             active_profile = self._active_profiles.get(device_id)
         if usb_id:
-            hw_id = hidpp.get_onboard_profile(*usb_id)
+            hw_id = hidpp.get_onboard_profile(*usb_id, **self._hidpp_kwargs(device_id))
             hw_idx = hidpp.onboard_profile_index(hw_id)
             if hw_idx is not None:
                 with self._topology_lock:
@@ -603,7 +611,7 @@ class RatbagBackend(BaseBackend):
         # ratbagd commits asynchronously over hidraw; wait before sending HID++ traffic
         # so we don't collide with the flash write, then reload the active profile into RAM.
         time.sleep(1.5)
-        hidpp.set_onboard_profile(*usb_id, hidpp_profile_id)
+        hidpp.set_onboard_profile(*usb_id, hidpp_profile_id, **self._hidpp_kwargs(device_id))
 
     def _ensure_ratbagd_running(self) -> bool:
         if not self._dbus.is_bus_available():
@@ -865,9 +873,14 @@ class RatbagBackend(BaseBackend):
 
             caps = [Capability.PROFILES]
             usb_id = (vid, pid) if (vid and pid) else None
+            hidpp_kwargs = {"device_name": dev_name, "device_key": dev_id} if dev_name else {}
 
             # ratbagd does not track hardware onboard profile switches; prefer live HID++ profile.
-            onboard_profile_id = hidpp.get_onboard_profile(vid, pid) if usb_id else None
+            onboard_profile_id = (
+                hidpp.get_onboard_profile(vid, pid, **hidpp_kwargs)
+                if usb_id
+                else None
+            )
             onboard_profile = (
                 hidpp.format_onboard_profile(onboard_profile_id)
                 if onboard_profile_id is not None
@@ -904,6 +917,7 @@ class RatbagBackend(BaseBackend):
                     prof_data["resolutions"],
                     profile_idx=selected_profile_idx,
                     usb_id=usb_id,
+                    hidpp_kwargs=hidpp_kwargs,
                     res_paths_out=local_res_paths,
                     res_xy_out=local_res_xy,
                     res_map_out=local_res_map,
@@ -940,6 +954,8 @@ class RatbagBackend(BaseBackend):
                     self._button_paths[dev_id] = {}
                 if usb_id:
                     self._usb_ids[dev_id] = usb_id
+                if dev_name:
+                    self._device_names[dev_id] = dev_name
 
             return Device(
                 id=dev_id,
@@ -967,6 +983,7 @@ class RatbagBackend(BaseBackend):
         res_paths: List[str],
         profile_idx: int = 0,
         usb_id: Optional[Tuple[str, str]] = None,
+        hidpp_kwargs: Optional[Dict[str, Any]] = None,
         res_paths_out: Optional[Dict[int, str]] = None,
         res_xy_out: Optional[Dict[int, bool]] = None,
         res_map_out: Optional[Dict[int, int]] = None,
@@ -1029,7 +1046,8 @@ class RatbagBackend(BaseBackend):
             with self._topology_lock:
                 usb_id = self._usb_ids.get(dev_id)
         if usb_id:
-            hw_dpi = hidpp.get_dpi(*usb_id)
+            kw = hidpp_kwargs if hidpp_kwargs is not None else self._hidpp_kwargs(dev_id)
+            hw_dpi = hidpp.get_dpi(*usb_id, **kw)
             if hw_dpi and 50 <= hw_dpi <= 30000:
                 info.current = hw_dpi
 
@@ -1105,7 +1123,7 @@ class RatbagBackend(BaseBackend):
     def set_dpi(self, device_id: str, dpi: int) -> bool:
         with self._topology_lock:
             usb_id = self._usb_ids.get(device_id)
-        if usb_id and hidpp.set_dpi(*usb_id, dpi):
+        if usb_id and hidpp.set_dpi(*usb_id, dpi, **self._hidpp_kwargs(device_id)):
             return True
         if not self.is_available():
             return False

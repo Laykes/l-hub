@@ -92,6 +92,7 @@ class ButtonTesterController(QObject):
                 dev.usb_vid,
                 dev.usb_pid,
                 on_input=lambda act, name: self._hidInputEvent.emit(act, name),
+                device_name=dev.name,
             )
             if mon.start():
                 self._hid_input_monitor = mon

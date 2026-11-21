@@ -302,6 +302,8 @@ class DeviceManager(QObject):
                             d.usb_pid,
                             on_profile_changed=lambda pid, k=dev_key: self._hidppProfileEvent.emit(k, pid),
                             on_dpi_changed=lambda dpi, k=dev_key: self._hidppDpiEvent.emit(k, dpi),
+                            device_name=d.name,
+                            device_key=dev_key,
                         )
                         if mon.start():
                             self._hidpp_monitors[dev_key] = mon
@@ -338,9 +340,10 @@ class DeviceManager(QObject):
                 self.onboardProfileChanged.emit(target_dev.name, label)
             if target_dev.usb_vid and target_dev.usb_pid:
                 vid, pid = target_dev.usb_vid, target_dev.usb_pid
+                dev_name = target_dev.name
 
                 def _read_new_dpi():
-                    dpi = hidpp.get_dpi(vid, pid)
+                    dpi = hidpp.get_dpi(vid, pid, device_name=dev_name, device_key=device_key)
                     if dpi and 50 <= dpi <= 30000:
                         self._hidppDpiEvent.emit(device_key, dpi)
 
