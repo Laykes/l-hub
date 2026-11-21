@@ -6,6 +6,8 @@ from PySide6.QtWidgets import QSystemTrayIcon, QMenu, QApplication
 from PySide6.QtGui import QIcon, QAction
 from PySide6.QtCore import QObject
 
+from .single_instance import restore_window
+
 ICON_PATH = Path(__file__).resolve().parent / "assets" / "io.github.lhub.LHub.svg"
 
 
@@ -132,10 +134,7 @@ class LHubTray(QObject):
             self._show_window()
 
     def _show_window(self):
-        if self.window:
-            self.window.show()
-            self.window.raise_()
-            self.window.requestActivate()
+        restore_window(self.window)
 
     def _quit(self):
         QApplication.instance().quit()

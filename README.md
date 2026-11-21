@@ -120,47 +120,39 @@ sudo systemctl enable --now ratbagd
 
 ### 3. Install L-Hub
 
-Clone the repository:
+Clone the repository and run the installer script:
 
 ```bash
 git clone https://github.com/Laykes/l-hub.git
 cd l-hub
+./install.sh
 ```
 
-Install Python dependencies (if not installed via your system package manager):
+This installs the launcher (`~/.local/bin/l-hub`), application icon, and desktop entry so **L-Hub** appears in your application menu / KRunner / Kickoff and can be pinned to your taskbar.
+
+> [!NOTE]
+> The launcher runs directly from the cloned repository directory, so keep the `l-hub` folder in place after installing (and pull updates with `git pull`).
+
+To uninstall later:
 
 ```bash
-pip install -e .
+./install.sh --uninstall
 ```
 
 ---
 
 ## Running L-Hub
 
-Start the application directly from the repository:
-
-```bash
-python3 -m lhub
-```
-
-Or, if installed with `pip install -e .`:
+Launch **L-Hub** from your application menu or KRunner, or run it from a terminal (if `~/.local/bin` is in your `PATH`):
 
 ```bash
 l-hub
 ```
 
-### Desktop Entry & App Icon
-
-To install the launcher (`~/.local/bin/l-hub`), application icon, and desktop entry for KRunner / Kickoff / app menus, run:
+Alternatively, you can run it directly from the repository without installing the desktop entry:
 
 ```bash
-./install.sh
-```
-
-To remove them later:
-
-```bash
-./install.sh --uninstall
+python3 -m lhub
 ```
 
 ---
