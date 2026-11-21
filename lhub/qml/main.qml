@@ -29,7 +29,7 @@ QQC2.ApplicationWindow {
     height: 700
     minimumWidth: 740
     minimumHeight: 520
-    visible: true
+    visible: typeof startMinimized === "undefined" ? true : !startMinimized
     color: theme.bgWindow
 
     function showToast(msg, isWarning) {
@@ -42,9 +42,12 @@ QQC2.ApplicationWindow {
     function deviceBatteryColor(dev) {
         if (!dev) return theme.textSecondary
         var pct = dev.batteryPercentage
+        var threshold = (typeof deviceManager !== "undefined" && deviceManager && deviceManager.lowBatteryThreshold !== undefined)
+                        ? deviceManager.lowBatteryThreshold
+                        : 20
         if (dev.isCharging && pct < 0) return theme.positive
         if (pct > 50) return theme.positive
-        if (pct > 20) return theme.warning
+        if (pct > threshold) return theme.warning
         return theme.danger
     }
 
@@ -100,9 +103,9 @@ QQC2.ApplicationWindow {
 
                     RowLayout {
                         anchors.fill: parent
-                        anchors.leftMargin: 16
-                        anchors.rightMargin: 14
-                        spacing: 12
+                        anchors.leftMargin: 14
+                        anchors.rightMargin: 12
+                        spacing: 10
 
                         Image {
                             source: Qt.resolvedUrl("../assets/io.github.lhub.LHub.svg")
@@ -122,6 +125,8 @@ QQC2.ApplicationWindow {
                                 color: theme.textPrimary
                                 font.pixelSize: 16
                                 font.weight: Font.Bold
+                                elide: Text.ElideRight
+                                Layout.fillWidth: true
                             }
 
                             Text {
@@ -129,19 +134,35 @@ QQC2.ApplicationWindow {
                                 color: theme.textMuted
                                 font.pixelSize: 11
                                 font.weight: Font.Medium
+                                elide: Text.ElideRight
+                                Layout.fillWidth: true
                             }
                         }
 
-                        UiButton {
-                            variant: "subtle"
-                            compact: true
-                            iconName: "view-refresh-symbolic"
-                            implicitWidth: 32
-                            implicitHeight: 32
-                            toolTipText: "Refresh devices"
-                            onClicked: {
-                                deviceManager.refresh_devices()
-                                root.showToast("Scanning for devices...")
+                        RowLayout {
+                            spacing: 4
+
+                            UiButton {
+                                variant: "subtle"
+                                compact: true
+                                iconName: "view-refresh-symbolic"
+                                implicitWidth: 32
+                                implicitHeight: 32
+                                toolTipText: "Refresh devices"
+                                onClicked: {
+                                    deviceManager.refresh_devices()
+                                    root.showToast("Scanning for devices...")
+                                }
+                            }
+
+                            UiButton {
+                                variant: "subtle"
+                                compact: true
+                                iconName: "preferences-system-symbolic"
+                                implicitWidth: 32
+                                implicitHeight: 32
+                                toolTipText: "Application settings"
+                                onClicked: settingsDialog.open()
                             }
                         }
                     }
@@ -776,6 +797,12 @@ QQC2.ApplicationWindow {
             deviceManager.remapButton(devId, btnIdx, action)
             root.showToast("Button remapped.")
         }
+    }
+
+    SettingsDialog {
+        id: settingsDialog
+
+        onSettingsSaved: root.showToast("Settings saved.")
     }
 
     // Create New Profile Modal
