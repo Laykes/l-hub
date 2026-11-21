@@ -19,7 +19,10 @@ _app = QGuiApplication.instance() or QGuiApplication(sys.argv)
 
 class TestButtonTester(unittest.TestCase):
     def setUp(self):
-        self.manager = DeviceManager()
+        self.manager = DeviceManager(auto_refresh=False, enable_hotplug=False)
+        self.manager.backends = []
+        self.manager.refresh_devices = MagicMock()
+        self.addCleanup(self.manager.cleanup)
         # Mock devices in manager
         test_buttons = [
             ButtonMapping(index=0, name="Button 1", action_value="button 1", action_display="Left Click"),

@@ -5,8 +5,16 @@ import glob
 import logging
 import os
 import shutil
-import subprocess
 from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
+
+from .backends.dbus_client import (
+    DBusError,
+    DBusTimeoutError,
+    SystemDBusClient,
+    get_system_dbus_client,
+)
+from .backends.ratbag import RATBAG_MANAGER_IFACE, RATBAG_MANAGER_PATH, RATBAG_SERVICE
+from .backends.upower import UPOWER_SERVICE
 
 logger = logging.getLogger(__name__)
 
@@ -18,15 +26,6 @@ ISSUE_SEVERITIES = frozenset({SEVERITY_WARNING, SEVERITY_ERROR})
 
 LOGITECH_VID = "046d"
 RATBAGD_FIX_HINT = "sudo systemctl enable --now ratbagd"
-
-_RATBAGD_ERROR_MARKERS = (
-    "unable to connect",
-    "ratbagd is not running",
-    "no one currently owns",
-    "ratbagd api version",
-    "access denied",
-    "permission denied",
-)
 
 
 @dataclass(frozen=True)
@@ -130,67 +129,72 @@ def _build_hidraw_udev_hint(vids: Sequence[str]) -> str:
     return f"printf '%s\\n' {quoted_rules} | {reload_cmd}"
 
 
-def check_ratbagd() -> HealthCheckItem:
-    """Verify ratbagctl is installed and the ratbagd daemon is reachable."""
-    ratbagctl = shutil.which("ratbagctl")
-    if not ratbagctl or not os.access(ratbagctl, os.X_OK):
+def check_ratbagd(dbus_client: Optional[SystemDBusClient] = None) -> HealthCheckItem:
+    """Verify ratbagd is reachable over system D-Bus (without CLI subprocesses)."""
+    client = dbus_client or get_system_dbus_client()
+    if not client.is_bus_available():
+        return HealthCheckItem(
+            id="ratbagd",
+            severity=SEVERITY_ERROR,
+            title="System D-Bus is unavailable",
+            description="Could not connect to the system D-Bus daemon. Mouse configuration is unavailable.",
+            fix_hint=RATBAGD_FIX_HINT,
+        )
+
+    try:
+        if client.has_name_owner(RATBAG_SERVICE):
+            client.get_property(
+                RATBAG_SERVICE,
+                RATBAG_MANAGER_PATH,
+                RATBAG_MANAGER_IFACE,
+                "APIVersion",
+            )
+            return HealthCheckItem(
+                id="ratbagd",
+                severity=SEVERITY_OK,
+                title="ratbagd is running",
+                description="libratbag daemon is reachable via D-Bus.",
+                fix_hint="",
+            )
+
+        if client.is_service_activatable(RATBAG_SERVICE) or bool(shutil.which("ratbagd")):
+            return HealthCheckItem(
+                id="ratbagd",
+                severity=SEVERITY_ERROR,
+                title="ratbagd service is not running",
+                description=(
+                    f"Could not connect to {RATBAG_SERVICE} on system D-Bus. "
+                    "Mouse configuration is unavailable."
+                ),
+                fix_hint=RATBAGD_FIX_HINT,
+            )
+
         return HealthCheckItem(
             id="ratbagd",
             severity=SEVERITY_WARNING,
-            title="libratbag (ratbagctl) is not installed",
+            title="libratbag (ratbagd) is not installed",
             description=(
                 "Gaming mouse configuration (DPI, profiles, button remapping) requires "
                 "libratbag and the ratbagd daemon."
             ),
             fix_hint="sudo pacman -S libratbag && sudo systemctl enable --now ratbagd",
         )
-
-    try:
-        res = subprocess.run(
-            [ratbagctl, "list"],
-            capture_output=True,
-            text=True,
-            timeout=4,
-        )
-    except subprocess.TimeoutExpired:
+    except DBusTimeoutError:
         return HealthCheckItem(
             id="ratbagd",
             severity=SEVERITY_ERROR,
             title="ratbagd service is not responding",
-            description="Timed out waiting for ratbagctl to reach the ratbagd daemon.",
+            description="Timed out waiting for ratbagd on system D-Bus.",
             fix_hint=RATBAGD_FIX_HINT,
         )
-    except OSError as exc:
+    except DBusError as exc:
         return HealthCheckItem(
             id="ratbagd",
             severity=SEVERITY_ERROR,
             title="ratbagd check failed",
-            description=f"Failed to execute ratbagctl: {exc}",
+            description=f"D-Bus error querying ratbagd: {exc}",
             fix_hint=RATBAGD_FIX_HINT,
         )
-
-    combined = f"{res.stdout or ''}\n{res.stderr or ''}".strip()
-    combined_lower = combined.lower()
-    daemon_unreachable = res.returncode != 0 or any(
-        marker in combined_lower for marker in _RATBAGD_ERROR_MARKERS
-    )
-    if daemon_unreachable:
-        detail = combined.splitlines()[0] if combined else f"ratbagctl exited with code {res.returncode}."
-        return HealthCheckItem(
-            id="ratbagd",
-            severity=SEVERITY_ERROR,
-            title="ratbagd service is not running",
-            description=f"Could not connect to ratbagd ({detail}). Mouse configuration is unavailable.",
-            fix_hint=RATBAGD_FIX_HINT,
-        )
-
-    return HealthCheckItem(
-        id="ratbagd",
-        severity=SEVERITY_OK,
-        title="ratbagd is running",
-        description="libratbag daemon is reachable.",
-        fix_hint="",
-    )
 
 
 def check_headsetcontrol() -> HealthCheckItem:
@@ -278,24 +282,36 @@ def check_hidraw_permissions(devices: Optional[Sequence[Any]] = None) -> HealthC
     )
 
 
-def check_upower() -> HealthCheckItem:
-    """Check whether the optional UPower CLI fallback is available."""
-    cmd = shutil.which("upower")
-    if cmd and os.access(cmd, os.X_OK):
-        return HealthCheckItem(
-            id="upower",
-            severity=SEVERITY_OK,
-            title="UPower is available",
-            description="UPower CLI is available as a wireless battery fallback.",
-            fix_hint="",
-        )
+def check_upower(dbus_client: Optional[SystemDBusClient] = None) -> HealthCheckItem:
+    """Check whether the optional UPower D-Bus service is available."""
+    client = dbus_client or get_system_dbus_client()
+    if client.is_bus_available():
+        if client.has_name_owner(UPOWER_SERVICE):
+            return HealthCheckItem(
+                id="upower",
+                severity=SEVERITY_OK,
+                title="UPower is available",
+                description="UPower D-Bus service is reachable for wireless battery monitoring.",
+                fix_hint="",
+            )
+        if client.is_service_activatable(UPOWER_SERVICE):
+            return HealthCheckItem(
+                id="upower",
+                severity=SEVERITY_INFO,
+                title="UPower is installed but not running (optional)",
+                description=(
+                    "UPower is an optional D-Bus service for battery status of Bluetooth and "
+                    "generic wireless peripherals."
+                ),
+                fix_hint="sudo systemctl enable --now upower",
+            )
 
     return HealthCheckItem(
         id="upower",
         severity=SEVERITY_INFO,
-        title="UPower not installed (optional)",
+        title="UPower not available (optional)",
         description=(
-            "UPower is an optional fallback for battery status of Bluetooth and "
+            "UPower is an optional D-Bus service for battery status of Bluetooth and "
             "generic wireless peripherals."
         ),
         fix_hint="sudo pacman -S upower",
@@ -321,13 +337,14 @@ def log_health_checks(items: Sequence[HealthCheckItem]) -> None:
 def run_health_checks(
     devices: Optional[Sequence[Any]] = None,
     log_results: bool = True,
+    dbus_client: Optional[SystemDBusClient] = None,
 ) -> List[HealthCheckItem]:
     """Run all system health checks and return structured results."""
     items = [
-        check_ratbagd(),
+        check_ratbagd(dbus_client=dbus_client),
         check_headsetcontrol(),
         check_hidraw_permissions(devices=devices),
-        check_upower(),
+        check_upower(dbus_client=dbus_client),
     ]
     if log_results:
         log_health_checks(items)

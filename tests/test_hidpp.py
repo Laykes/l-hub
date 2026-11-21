@@ -1,43 +1,76 @@
 import sys
 import unittest
-from unittest.mock import MagicMock, patch
 from pathlib import Path
+from unittest.mock import MagicMock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from lhub.backends import hidpp
 from lhub.backends.base import Capability, Device, DeviceType, DpiInfo
-from lhub.backends.ratbag import RatbagBackend
+from lhub.backends.ratbag import (
+    RATBAG_BUTTON_IFACE,
+    RATBAG_DEVICE_IFACE,
+    RATBAG_PROFILE_IFACE,
+    RATBAG_RESOLUTION_IFACE,
+    RATBAG_SERVICE,
+    RatbagActionType,
+    RatbagBackend,
+)
 from lhub.manager import DeviceManager
 
 
+def _make_dbus_mock(props_map):
+    dbus = MagicMock()
+    dbus.is_bus_available.return_value = True
+    dbus.has_name_owner.return_value = True
+    dbus.get_all_properties.side_effect = lambda svc, path, iface: dict(props_map.get((path, iface), {}))
+    dbus.get_property.side_effect = lambda svc, path, iface, prop: props_map.get((path, iface), {}).get(prop)
+    dbus.call_method.return_value = (0,)
+    return dbus
+
+
 class TestHidppDpi(unittest.TestCase):
-    def setUp(self):
-        self.backend = RatbagBackend()
-        self.backend._usb_ids["mouse"] = ("046d", "c099")
+    def test_set_dpi_uses_hidpp_and_skips_dbus(self):
+        dbus = _make_dbus_mock({})
+        backend = RatbagBackend(dbus_client=dbus)
+        backend._usb_ids["mouse"] = ("046d", "c099")
 
-    @patch("subprocess.run")
-    @patch("lhub.backends.ratbag.hidpp.set_dpi", return_value=True)
-    def test_set_dpi_uses_hidpp_and_skips_ratbagctl(self, mock_hidpp, mock_run):
-        self.assertTrue(self.backend.set_dpi("mouse", 2400))
+        with patch("lhub.backends.ratbag.hidpp.set_dpi", return_value=True) as mock_hidpp:
+            self.assertTrue(backend.set_dpi("mouse", 2400))
         mock_hidpp.assert_called_once_with("046d", "c099", 2400)
-        mock_run.assert_not_called()
+        dbus.set_property.assert_not_called()
+        dbus.call_method.assert_not_called()
 
-    @patch("subprocess.run")
+    @patch("lhub.backends.ratbag.hidpp.get_onboard_profile", return_value=None)
     @patch("lhub.backends.ratbag.hidpp.set_dpi", return_value=False)
-    def test_set_dpi_falls_back_to_ratbagctl(self, mock_hidpp, mock_run):
-        mock_run.return_value = MagicMock(returncode=0, stdout="", stderr="")
-        self.backend._ctl = "ratbagctl"
-        self.backend._resolution_maps["mouse"] = {}
-        self.assertTrue(self.backend.set_dpi("mouse", 2400))
-        self.assertTrue(mock_run.called)
+    def test_set_dpi_falls_back_to_dbus(self, mock_hidpp, mock_get_prof):
+        dev_path = "/org/freedesktop/ratbag1/device/mouse"
+        r0_path = "/org/freedesktop/ratbag1/resolution/mouse/p0/r0"
+        dbus = _make_dbus_mock({(r0_path, RATBAG_RESOLUTION_IFACE): {"Index": 0, "IsActive": True}})
+        backend = RatbagBackend(dbus_client=dbus)
+        backend._usb_ids["mouse"] = ("046d", "c099")
+        backend._device_paths["mouse"] = dev_path
+        backend._active_profiles["mouse"] = 0
+        backend._profile_paths["mouse"] = {0: "/org/freedesktop/ratbag1/profile/mouse/p0"}
+        backend._resolution_paths["mouse"] = {0: {0: r0_path}}
+        backend._resolution_is_xy["mouse"] = {0: {0: False}}
+        backend._resolution_maps["mouse"] = {}
 
-    @patch("subprocess.run")
+        self.assertTrue(backend.set_dpi("mouse", 2400))
+        dbus.set_property.assert_called_once_with(
+            RATBAG_SERVICE, r0_path, RATBAG_RESOLUTION_IFACE, "Resolution", "v", ("u", 2400)
+        )
+        dbus.call_method.assert_called_once_with(RATBAG_SERVICE, dev_path, RATBAG_DEVICE_IFACE, "Commit")
+
     @patch("lhub.backends.ratbag.hidpp.get_dpi", return_value=1200)
-    def test_get_dpi_prefers_hardware_value(self, mock_hidpp, mock_run):
-        # ratbagd reports a stale/invalid value
-        mock_run.return_value = MagicMock(returncode=0, stdout="65535dpi\n", stderr="")
-        info = self.backend._get_dpi("mouse", ["Resolutions:", "0: 800dpi", "1: 1600dpi (active)"])
+    def test_get_dpi_prefers_hardware_value(self, mock_hidpp):
+        props_map = {
+            ("/r0", RATBAG_RESOLUTION_IFACE): {"Index": 0, "Resolution": ("u", 800), "IsActive": False},
+            ("/r1", RATBAG_RESOLUTION_IFACE): {"Index": 1, "Resolution": ("u", 65535), "IsActive": True},
+        }
+        backend = RatbagBackend(dbus_client=_make_dbus_mock(props_map))
+        backend._usb_ids["mouse"] = ("046d", "c099")
+        info = backend._read_dpi("mouse", ["/r0", "/r1"], profile_idx=0)
         self.assertEqual(info.current, 1200)
         self.assertIn(1200, info.steps)
 
@@ -66,94 +99,112 @@ class TestHidppOnboardProfiles(unittest.TestCase):
 
     @patch("lhub.backends.ratbag.hidpp.get_dpi", return_value=1600)
     @patch("lhub.backends.ratbag.hidpp.get_onboard_profile", return_value=0x0001)
-    @patch("subprocess.run")
     def test_inspect_device_uses_live_hidpp_profile_over_stale_ratbag_active(
-        self, mock_run, mock_prof, mock_dpi
+        self, mock_prof, mock_dpi
     ):
-        info_out = (
-            "chanting-squirrel - Logitech G502 X\n"
-            "             Model: usb:046d:c099:0\n"
-            " Number of Buttons: 11\n"
-            "Profile 0:\n"
-            "  Resolutions:\n"
-            "    0: 1600dpi (active)\n"
-            "  Button: 6 is mapped to 'wheel-left'\n"
-            "Profile 1: (active)\n"
-            "  Resolutions:\n"
-            "    0: 1600dpi (active)\n"
-            "  Button: 6 is mapped to key 'KEY_PLAYPAUSE'\n"
-        )
-        mock_run.side_effect = [
-            MagicMock(returncode=0, stdout=info_out, stderr=""),
-            MagicMock(returncode=0, stdout="1600dpi\n", stderr=""),
-        ]
-        backend = RatbagBackend()
-        backend._ctl = "ratbagctl"
-        dev = backend._inspect_device("chanting-squirrel", "Logitech G502 X")
+        dev_path = "/org/freedesktop/ratbag1/device/hidraw6"
+        p0 = "/org/freedesktop/ratbag1/profile/hidraw6/p0"
+        p1 = "/org/freedesktop/ratbag1/profile/hidraw6/p1"
+        props_map = {
+            (dev_path, RATBAG_DEVICE_IFACE): {
+                "Name": "Logitech G502 X",
+                "Model": "usb:046d:c099:0",
+                "DeviceType": 2,
+                "Profiles": [p0, p1],
+            },
+            (p0, RATBAG_PROFILE_IFACE): {
+                "Index": 0,
+                "Disabled": False,
+                "IsActive": False,
+                "Resolutions": ["/r0"],
+                "Buttons": ["/p0/b6"],
+            },
+            (p1, RATBAG_PROFILE_IFACE): {
+                "Index": 1,
+                "Disabled": False,
+                "IsActive": True,
+                "Resolutions": ["/r1"],
+                "Buttons": ["/p1/b6"],
+            },
+            ("/r0", RATBAG_RESOLUTION_IFACE): {"Index": 0, "Resolution": ("u", 1600), "IsActive": True},
+            ("/r1", RATBAG_RESOLUTION_IFACE): {"Index": 0, "Resolution": ("u", 1600), "IsActive": True},
+            ("/p0/b6", RATBAG_BUTTON_IFACE): {
+                "Index": 6,
+                "Mapping": (int(RatbagActionType.SPECIAL), ("u", (1 << 30) + 2)),  # wheel-left
+            },
+            ("/p1/b6", RATBAG_BUTTON_IFACE): {
+                "Index": 6,
+                "Mapping": (int(RatbagActionType.KEY), ("u", 164)),  # KEY_PLAYPAUSE
+            },
+        }
+        backend = RatbagBackend(dbus_client=_make_dbus_mock(props_map))
+        dev = backend._inspect_device("ratbag_hidraw6", dev_path)
         self.assertIsNotNone(dev)
         self.assertEqual(dev.onboard_profile_id, 0x0001)
-        self.assertEqual(backend._active_profiles["chanting-squirrel"], 0)
+        self.assertEqual(backend._active_profiles["ratbag_hidraw6"], 0)
         self.assertEqual(len(dev.buttons), 1)
         self.assertEqual(dev.buttons[0].action_value, "special wheel-left")
 
     @patch("lhub.backends.ratbag.time.sleep")
     @patch("lhub.backends.ratbag.hidpp.set_onboard_profile", return_value=True)
     @patch("lhub.backends.ratbag.hidpp.get_onboard_profile", return_value=0x0001)
-    @patch("subprocess.run")
     def test_remap_button_targets_live_hidpp_profile_and_reloads(
-        self, mock_run, mock_get_prof, mock_set_prof, mock_sleep
+        self, mock_get_prof, mock_set_prof, mock_sleep
     ):
-        mock_run.return_value = MagicMock(returncode=0, stdout="", stderr="")
-        backend = RatbagBackend()
-        backend._ctl = "ratbagctl"
+        dev_path = "/org/freedesktop/ratbag1/device/mouse"
+        btn_path = "/org/freedesktop/ratbag1/button/mouse/p0/b6"
+        dbus = _make_dbus_mock({})
+        backend = RatbagBackend(dbus_client=dbus)
         backend._usb_ids["mouse"] = ("046d", "c099")
+        backend._device_paths["mouse"] = dev_path
+        backend._profile_paths["mouse"] = {0: "/org/freedesktop/ratbag1/profile/mouse/p0"}
+        backend._button_paths["mouse"] = {0: {6: btn_path}}
+        backend._resolution_paths["mouse"] = {0: {}}
+        backend._resolution_is_xy["mouse"] = {0: {}}
 
         ok = backend.remap_button("mouse", 6, "key KEY_PLAYPAUSE")
         self.assertTrue(ok)
-        mock_run.assert_called_once()
-        cmd = mock_run.call_args[0][0]
-        self.assertEqual(
-            cmd,
-            ["ratbagctl", "mouse", "profile", "0", "button", "6", "action", "set", "key", "KEY_PLAYPAUSE"],
+        dbus.set_property.assert_called_once_with(
+            RATBAG_SERVICE,
+            btn_path,
+            RATBAG_BUTTON_IFACE,
+            "Mapping",
+            "(uv)",
+            (int(RatbagActionType.KEY), ("u", 164)),
         )
+        dbus.call_method.assert_called_once_with(RATBAG_SERVICE, dev_path, RATBAG_DEVICE_IFACE, "Commit")
         mock_sleep.assert_called_once()
         mock_set_prof.assert_called_once_with("046d", "c099", 0x0001)
 
     def test_parse_onboard_profile_change_events(self):
-        # Long report: feature_idx=0x14, event=0, swid=0, profile=0x0002
         long_pkt = bytes([0x11, 0xFF, 0x14, 0x00, 0x00, 0x02]) + bytes(14)
         self.assertEqual(hidpp.parse_onboard_event(long_pkt, 0x14), ("profile", 0x0002))
 
-        # Short report: feature_idx=0x14, event=0, swid=0, profile=0x0102
         short_pkt = bytes([0x10, 0xFF, 0x14, 0x00, 0x01, 0x02, 0x00])
         self.assertEqual(hidpp.parse_onboard_event(short_pkt, 0x14), ("profile", 0x0102))
 
-        # Event 1: currentDPIIndexChanged
         dpi_pkt = bytes([0x11, 0xFF, 0x14, 0x10, 0x03, 0x00]) + bytes(14)
         self.assertEqual(hidpp.parse_onboard_event(dpi_pkt, 0x14), ("dpi_index", 3))
 
     def test_parse_onboard_event_ignores_replies_and_invalid_packets(self):
-        # Non-zero SWID (reply to host request, not unsolicited event)
         reply_pkt = bytes([0x11, 0xFF, 0x14, 0x47, 0x00, 0x01]) + bytes(14)
         self.assertIsNone(hidpp.parse_onboard_event(reply_pkt, 0x14))
 
-        # Wrong feature index
         wrong_feat = bytes([0x11, 0xFF, 0x12, 0x00, 0x00, 0x01]) + bytes(14)
         self.assertIsNone(hidpp.parse_onboard_event(wrong_feat, 0x14))
 
-        # Zero profile ID
         zero_prof = bytes([0x11, 0xFF, 0x14, 0x00, 0x00, 0x00]) + bytes(14)
         self.assertIsNone(hidpp.parse_onboard_event(zero_prof, 0x14))
 
-        # Truncated packet
         self.assertIsNone(hidpp.parse_onboard_event(bytes([0x11, 0xFF, 0x14, 0x00]), 0x14))
 
     @patch.object(DeviceManager, "refresh_devices")
     @patch("lhub.manager.hidpp.get_dpi", return_value=None)
     def test_manager_updates_onboard_profile_live_and_emits_signals(self, mock_dpi, mock_refresh):
-        mgr = DeviceManager()
+        mgr = DeviceManager(auto_refresh=False, enable_hotplug=False)
+        self.addCleanup(mgr.cleanup)
         dev = Device(
-            id="chanting-squirrel",
+            id="ratbag_hidraw6",
             name="Logitech G502 X",
             vendor="Logitech",
             device_type=DeviceType.MOUSE,
@@ -173,7 +224,6 @@ class TestHidppOnboardProfiles(unittest.TestCase):
         mgr.onboardProfileChanged.connect(lambda n, p: profile_events.append((n, p)))
         mgr.devicesChanged.connect(lambda: dev_changes.append(True))
 
-        # Profile changes from 0x0001 -> 0x0002
         mock_refresh.reset_mock()
         mgr._on_hidpp_profile_event("046d:c099", 0x0002)
         self.assertEqual(dev.onboard_profile_id, 0x0002)
@@ -184,20 +234,16 @@ class TestHidppOnboardProfiles(unittest.TestCase):
         self.assertEqual(len(dev_changes), 1)
         mock_refresh.assert_called_once()
 
-        # Duplicate event for same profile does not re-emit
         mgr._on_hidpp_profile_event("046d:c099", 0x0002)
         self.assertEqual(len(profile_events), 1)
         self.assertEqual(len(dev_changes), 1)
         mock_refresh.assert_called_once()
 
-        # Live DPI update event
         mgr._on_hidpp_dpi_event("046d:c099", 2400)
         self.assertEqual(dev.dpi.current, 2400)
         self.assertIn(2400, dev.dpi.steps)
         self.assertEqual(mgr._cached_dict_devices[0]["currentDpi"], 2400)
         self.assertEqual(len(dev_changes), 2)
-
-        mgr.cleanup()
 
 
 if __name__ == "__main__":

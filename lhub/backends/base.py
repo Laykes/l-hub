@@ -1,6 +1,6 @@
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import List, Optional, Dict, Any
+from typing import List, Optional, Dict, Any, Callable
 
 
 class DeviceType(Enum):
@@ -107,4 +107,17 @@ class BaseBackend:
 
     def reset_defaults(self, device_id: str) -> bool:
         return False
+
+    @property
+    def supports_hotplug(self) -> bool:
+        """Whether this backend supports event-driven hotplug/property monitoring."""
+        return False
+
+    def start_monitoring(self, on_change: Callable[[], None]) -> bool:
+        """Start monitoring for backend events and invoke ``on_change`` on updates."""
+        return False
+
+    def stop_monitoring(self) -> None:
+        """Stop event monitoring and clean up any active subscriptions."""
+        return None
 
