@@ -126,6 +126,7 @@ class TestHealthChecks(unittest.TestCase):
         activatable=None,
         api_version=2,
         get_prop_error=None,
+        start_error=None,
     ):
         owners = set(owners or ())
         activatable = set(activatable or ())
@@ -133,6 +134,10 @@ class TestHealthChecks(unittest.TestCase):
         client.is_bus_available.return_value = bus_ok
         client.has_name_owner.side_effect = lambda svc: svc in owners
         client.is_service_activatable.side_effect = lambda svc: svc in activatable
+        if start_error is not None:
+            client.start_service_by_name.side_effect = start_error
+        else:
+            client.start_service_by_name.return_value = 1
         if get_prop_error is not None:
             client.get_property.side_effect = get_prop_error
         else:
@@ -149,11 +154,28 @@ class TestHealthChecks(unittest.TestCase):
         self.assertIn("sudo systemctl enable --now ratbagd", item.fix_hint)
 
     def test_ratbagd_installed_but_not_running(self):
-        client = self._make_dbus_client(bus_ok=True, owners=(), activatable={RATBAG_SERVICE})
+        client = self._make_dbus_client(
+            bus_ok=True,
+            owners=(),
+            activatable={RATBAG_SERVICE},
+            start_error=DBusCallError("org.freedesktop.systemd1.NoSuchUnit", "disabled"),
+        )
         item = check_ratbagd(dbus_client=client)
         self.assertEqual(item.severity, SEVERITY_ERROR)
         self.assertTrue(item.is_issue)
         self.assertEqual(item.fix_hint, RATBAGD_FIX_HINT)
+
+    def test_ratbagd_activates_on_demand_via_dbus(self):
+        client = self._make_dbus_client(
+            bus_ok=True,
+            owners=(),
+            activatable={RATBAG_SERVICE},
+            api_version=2,
+        )
+        item = check_ratbagd(dbus_client=client)
+        self.assertEqual(item.severity, SEVERITY_OK)
+        self.assertFalse(item.is_issue)
+        client.start_service_by_name.assert_called_once_with(RATBAG_SERVICE)
 
     def test_ratbagd_bus_unavailable_timeout_and_call_error(self):
         no_bus = self._make_dbus_client(bus_ok=False)

@@ -354,7 +354,7 @@ class SystemDBusClient:
             raise DBusUnavailableError("jeepney is not installed")
         try:
             return open_dbus_connection(bus="SYSTEM", auth_timeout=min(self._timeout, 2.0))
-        except (OSError, TimeoutError) as exc:
+        except (OSError, TimeoutError, ValueError, StopIteration, DBusErrorResponse) as exc:
             raise DBusUnavailableError(f"Could not connect to system D-Bus: {exc}") from exc
 
     def _close_connection_locked(self) -> None:
@@ -473,6 +473,24 @@ class SystemDBusClient:
             return service in self.list_activatable_names(timeout=timeout)
         except DBusError:
             return False
+
+    def start_service_by_name(
+        self,
+        service: str,
+        flags: int = 0,
+        timeout: Optional[float] = None,
+    ) -> int:
+        reply = self.call_method(
+            DBUS_SERVICE,
+            DBUS_PATH,
+            DBUS_IFACE,
+            "StartServiceByName",
+            "su",
+            (service, int(flags)),
+            timeout=timeout,
+            auto_start=True,
+        )
+        return int(reply[0]) if reply else 0
 
     def get_property(
         self,

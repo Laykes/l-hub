@@ -3,6 +3,7 @@
 from enum import IntEnum
 import logging
 import re
+import threading
 import time
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
@@ -99,7 +100,7 @@ SPECIAL_TO_NAME: Dict[int, str] = {
 NAME_TO_SPECIAL: Dict[str, int] = {
     name: code
     for code, name in SPECIAL_TO_NAME.items()
-    if code != int(RatbagActionSpecial.INVALID)
+    if code not in (int(RatbagActionSpecial.INVALID), int(RatbagActionSpecial.UNKNOWN))
 }
 
 
@@ -373,7 +374,7 @@ def parse_button_action(raw_val: str) -> Tuple[str, str]:
         action = f"key {k}"
     elif val == "none":
         action = "disabled"
-    elif val == "UNKNOWN":
+    elif val.lower() == "unknown":
         action = "unknown"
     elif val in [
         "resolution-alternate",
@@ -568,6 +569,7 @@ class RatbagBackend(BaseBackend):
     def __init__(self, dbus_client: Optional[SystemDBusClient] = None):
         super().__init__("ratbagd")
         self._dbus = dbus_client or get_system_dbus_client()
+        self._topology_lock = threading.Lock()
         self._device_paths: Dict[str, str] = {}
         self._profile_paths: Dict[str, Dict[int, str]] = {}
         self._resolution_paths: Dict[str, Dict[int, Dict[int, str]]] = {}
@@ -577,20 +579,25 @@ class RatbagBackend(BaseBackend):
         self._usb_ids: Dict[str, Tuple[str, str]] = {}
         self._active_profiles: Dict[str, int] = {}
         self._subscription_ids: List[int] = []
+        self._activation_failed: bool = False
 
     def _resolve_active_profile(self, device_id: str) -> Tuple[Optional[int], Optional[int]]:
         """Return (0-based ratbag profile index, 16-bit HID++ profile ID)."""
-        usb_id = self._usb_ids.get(device_id)
+        with self._topology_lock:
+            usb_id = self._usb_ids.get(device_id)
+            active_profile = self._active_profiles.get(device_id)
         if usb_id:
             hw_id = hidpp.get_onboard_profile(*usb_id)
             hw_idx = hidpp.onboard_profile_index(hw_id)
             if hw_idx is not None:
-                self._active_profiles[device_id] = hw_idx
+                with self._topology_lock:
+                    self._active_profiles[device_id] = hw_idx
                 return hw_idx, hw_id
-        return self._active_profiles.get(device_id), None
+        return active_profile, None
 
     def _finalize_hidpp_commit(self, device_id: str, hidpp_profile_id: Optional[int]) -> None:
-        usb_id = self._usb_ids.get(device_id)
+        with self._topology_lock:
+            usb_id = self._usb_ids.get(device_id)
         if not usb_id or hidpp_profile_id is None:
             return
         # ratbagd commits asynchronously over hidraw; wait before sending HID++ traffic
@@ -598,8 +605,25 @@ class RatbagBackend(BaseBackend):
         time.sleep(1.5)
         hidpp.set_onboard_profile(*usb_id, hidpp_profile_id)
 
+    def _ensure_ratbagd_running(self) -> bool:
+        if not self._dbus.is_bus_available():
+            return False
+        if self._dbus.has_name_owner(RATBAG_SERVICE):
+            self._activation_failed = False
+            return True
+        if self._activation_failed or not self._dbus.is_service_activatable(RATBAG_SERVICE):
+            return False
+        try:
+            self._dbus.start_service_by_name(RATBAG_SERVICE)
+            self._activation_failed = False
+            return True
+        except DBusError as exc:
+            logger.debug("On-demand D-Bus activation of %s failed: %s", RATBAG_SERVICE, exc)
+            self._activation_failed = True
+            return False
+
     def is_available(self) -> bool:
-        return self._dbus.is_bus_available() and self._dbus.has_name_owner(RATBAG_SERVICE)
+        return self._ensure_ratbagd_running()
 
     def get_missing_reason(self) -> str:
         if not self.is_available():
@@ -619,6 +643,7 @@ class RatbagBackend(BaseBackend):
 
         def _on_name_owner_changed(event: DBusSignalEvent) -> None:
             if event.args and event.args[0] == RATBAG_SERVICE:
+                self._activation_failed = False
                 on_change()
 
         for sig_args in (
@@ -679,10 +704,13 @@ class RatbagBackend(BaseBackend):
         return devices
 
     def _resolve_device_path(self, device_id: str) -> Optional[str]:
-        if device_id in self._device_paths:
-            return self._device_paths[device_id]
+        with self._topology_lock:
+            cached = self._device_paths.get(device_id)
+        if cached:
+            return cached
         if device_id.startswith("/org/freedesktop/ratbag1/"):
-            self._device_paths[device_id] = device_id
+            with self._topology_lock:
+                self._device_paths[device_id] = device_id
             return device_id
 
         try:
@@ -695,16 +723,18 @@ class RatbagBackend(BaseBackend):
                 path = str(raw_path)
                 leaf = path.rsplit("/", 1)[-1]
                 if device_id in (path, leaf, f"ratbag_{leaf}"):
-                    self._device_paths[device_id] = path
+                    with self._topology_lock:
+                        self._device_paths[device_id] = path
                     return path
         except DBusError as exc:
             logger.debug("Could not resolve ratbag device path for %s: %s", device_id, exc)
         return None
 
     def _ensure_device_profiles(self, device_id: str, dev_path: str) -> Dict[int, str]:
-        prof_map = self._profile_paths.get(device_id)
-        if prof_map:
-            return prof_map
+        with self._topology_lock:
+            prof_map = self._profile_paths.get(device_id)
+            if prof_map:
+                return dict(prof_map)
 
         dev_props = self._dbus.get_all_properties(RATBAG_SERVICE, dev_path, RATBAG_DEVICE_IFACE)
         prof_paths = [str(p) for p in (dev_props.get("Profiles") or [])]
@@ -716,10 +746,11 @@ class RatbagBackend(BaseBackend):
             new_map[p_idx] = prof_path
             if prof_props.get("IsActive") and not prof_props.get("Disabled", False):
                 active_fallback = p_idx
-        self._profile_paths[device_id] = new_map
-        if device_id not in self._active_profiles and active_fallback is not None:
-            self._active_profiles[device_id] = active_fallback
-        return new_map
+        with self._topology_lock:
+            self._profile_paths[device_id] = new_map
+            if device_id not in self._active_profiles and active_fallback is not None:
+                self._active_profiles[device_id] = active_fallback
+        return dict(new_map)
 
     def _ensure_profile_topology(self, device_id: str, dev_path: str, profile_idx: int) -> None:
         prof_map = self._ensure_device_profiles(device_id, dev_path)
@@ -727,32 +758,40 @@ class RatbagBackend(BaseBackend):
         if not prof_path:
             return
 
-        prof_btn_map = self._button_paths.setdefault(device_id, {}).get(profile_idx)
-        prof_res_map = self._resolution_paths.setdefault(device_id, {}).get(profile_idx)
+        with self._topology_lock:
+            prof_btn_map = self._button_paths.get(device_id, {}).get(profile_idx)
+            prof_res_map = self._resolution_paths.get(device_id, {}).get(profile_idx)
         if prof_btn_map is not None and prof_res_map is not None:
             return
 
         prof_props = self._dbus.get_all_properties(RATBAG_SERVICE, prof_path, RATBAG_PROFILE_IFACE)
+        new_res_dict: Optional[Dict[int, str]] = None
+        new_xy_dict: Optional[Dict[int, bool]] = None
         if prof_res_map is None:
-            res_dict: Dict[int, str] = {}
-            xy_dict: Dict[int, bool] = {}
+            new_res_dict = {}
+            new_xy_dict = {}
             for i, raw_r in enumerate(prof_props.get("Resolutions") or []):
                 r_path = str(raw_r)
                 r_props = self._dbus.get_all_properties(RATBAG_SERVICE, r_path, RATBAG_RESOLUTION_IFACE)
                 r_idx = int(r_props["Index"]) if "Index" in r_props else i
-                res_dict[r_idx] = r_path
-                xy_dict[r_idx] = len(unpack_dbus_resolution(r_props.get("Resolution"))) == 2
-            self._resolution_paths.setdefault(device_id, {})[profile_idx] = res_dict
-            self._resolution_is_xy.setdefault(device_id, {})[profile_idx] = xy_dict
+                new_res_dict[r_idx] = r_path
+                new_xy_dict[r_idx] = len(unpack_dbus_resolution(r_props.get("Resolution"))) == 2
 
+        new_btn_dict: Optional[Dict[int, str]] = None
         if prof_btn_map is None:
-            btn_dict: Dict[int, str] = {}
+            new_btn_dict = {}
             for i, raw_b in enumerate(prof_props.get("Buttons") or []):
                 b_path = str(raw_b)
                 b_props = self._dbus.get_all_properties(RATBAG_SERVICE, b_path, RATBAG_BUTTON_IFACE)
                 b_idx = int(b_props["Index"]) if "Index" in b_props else i
-                btn_dict[b_idx] = b_path
-            self._button_paths.setdefault(device_id, {})[profile_idx] = btn_dict
+                new_btn_dict[b_idx] = b_path
+
+        with self._topology_lock:
+            if new_res_dict is not None and new_xy_dict is not None:
+                self._resolution_paths.setdefault(device_id, {})[profile_idx] = new_res_dict
+                self._resolution_is_xy.setdefault(device_id, {})[profile_idx] = new_xy_dict
+            if new_btn_dict is not None:
+                self._button_paths.setdefault(device_id, {})[profile_idx] = new_btn_dict
 
     def _commit(self, dev_path: str) -> bool:
         try:
@@ -799,11 +838,11 @@ class RatbagBackend(BaseBackend):
             else:
                 device_type = DeviceType.MOUSE
 
-            self._device_paths[dev_id] = resolved_path
-            self._profile_paths[dev_id] = {}
-            self._resolution_paths[dev_id] = {}
-            self._resolution_is_xy[dev_id] = {}
-            self._button_paths[dev_id] = {}
+            local_profile_paths: Dict[int, str] = {}
+            local_res_paths: Dict[int, str] = {}
+            local_res_xy: Dict[int, bool] = {}
+            local_btn_paths: Dict[int, str] = {}
+            local_res_map: Dict[int, int] = {}
 
             profiles_info: Dict[int, Dict[str, Any]] = {}
             ratbag_active_idx: Optional[int] = None
@@ -811,7 +850,7 @@ class RatbagBackend(BaseBackend):
                 p_path = str(raw_p)
                 p_props = self._dbus.get_all_properties(RATBAG_SERVICE, p_path, RATBAG_PROFILE_IFACE)
                 p_idx = int(p_props["Index"]) if "Index" in p_props else i
-                self._profile_paths[dev_id][p_idx] = p_path
+                local_profile_paths[p_idx] = p_path
                 disabled = bool(p_props.get("Disabled", False))
                 is_active = bool(p_props.get("IsActive", False))
                 profiles_info[p_idx] = {
@@ -825,11 +864,10 @@ class RatbagBackend(BaseBackend):
                     ratbag_active_idx = p_idx
 
             caps = [Capability.PROFILES]
-            if vid and pid:
-                self._usb_ids[dev_id] = (vid, pid)
+            usb_id = (vid, pid) if (vid and pid) else None
 
             # ratbagd does not track hardware onboard profile switches; prefer live HID++ profile.
-            onboard_profile_id = hidpp.get_onboard_profile(vid, pid) if (vid and pid) else None
+            onboard_profile_id = hidpp.get_onboard_profile(vid, pid) if usb_id else None
             onboard_profile = (
                 hidpp.format_onboard_profile(onboard_profile_id)
                 if onboard_profile_id is not None
@@ -859,13 +897,16 @@ class RatbagBackend(BaseBackend):
                 dpi_info.is_disabled = True
                 status_note = "On-board memory profile disabled"
             else:
-                self._active_profiles[dev_id] = selected_profile_idx
                 caps.extend([Capability.DPI, Capability.BUTTON_REMAP])
                 prof_data = profiles_info[selected_profile_idx]
                 dpi_info = self._read_dpi(
                     dev_id,
                     prof_data["resolutions"],
                     profile_idx=selected_profile_idx,
+                    usb_id=usb_id,
+                    res_paths_out=local_res_paths,
+                    res_xy_out=local_res_xy,
+                    res_map_out=local_res_map,
                 )
                 buttons = self._read_buttons(
                     dev_id,
@@ -874,6 +915,7 @@ class RatbagBackend(BaseBackend):
                     vid=vid,
                     pid=pid,
                     profile_idx=selected_profile_idx,
+                    btn_paths_out=local_btn_paths,
                 )
 
             layout = find_device_layout(dev_name, vid, pid)
@@ -882,6 +924,22 @@ class RatbagBackend(BaseBackend):
                 if layout is not None
                 else ("Logitech" if "logitech" in dev_name.lower() or "046d" in vid else "Generic")
             )
+
+            with self._topology_lock:
+                self._device_paths[dev_id] = resolved_path
+                self._profile_paths[dev_id] = local_profile_paths
+                if selected_profile_idx is not None:
+                    self._resolution_paths[dev_id] = {selected_profile_idx: local_res_paths}
+                    self._resolution_is_xy[dev_id] = {selected_profile_idx: local_res_xy}
+                    self._button_paths[dev_id] = {selected_profile_idx: local_btn_paths}
+                    self._resolution_maps[dev_id] = local_res_map
+                    self._active_profiles[dev_id] = selected_profile_idx
+                else:
+                    self._resolution_paths[dev_id] = {}
+                    self._resolution_is_xy[dev_id] = {}
+                    self._button_paths[dev_id] = {}
+                if usb_id:
+                    self._usb_ids[dev_id] = usb_id
 
             return Device(
                 id=dev_id,
@@ -908,15 +966,19 @@ class RatbagBackend(BaseBackend):
         dev_id: str,
         res_paths: List[str],
         profile_idx: int = 0,
+        usb_id: Optional[Tuple[str, str]] = None,
+        res_paths_out: Optional[Dict[int, str]] = None,
+        res_xy_out: Optional[Dict[int, bool]] = None,
+        res_map_out: Optional[Dict[int, int]] = None,
     ) -> DpiInfo:
         info = DpiInfo()
         valid_steps: List[int] = []
         current_from_ratbag: Optional[int] = None
-        res_map: Dict[int, int] = {}
+        res_map: Dict[int, int] = res_map_out if res_map_out is not None else {}
         supported_vals: List[int] = []
 
-        dev_res_paths = self._resolution_paths.setdefault(dev_id, {}).setdefault(profile_idx, {})
-        dev_res_xy = self._resolution_is_xy.setdefault(dev_id, {}).setdefault(profile_idx, {})
+        dev_res_paths: Dict[int, str] = res_paths_out if res_paths_out is not None else {}
+        dev_res_xy: Dict[int, bool] = res_xy_out if res_xy_out is not None else {}
 
         for i, res_path in enumerate(res_paths):
             try:
@@ -950,12 +1012,22 @@ class RatbagBackend(BaseBackend):
                 if is_active:
                     current_from_ratbag = val
 
-        self._resolution_maps[dev_id] = res_map
+        if res_paths_out is None or res_xy_out is None or res_map_out is None:
+            with self._topology_lock:
+                if res_paths_out is None:
+                    self._resolution_paths.setdefault(dev_id, {})[profile_idx] = dev_res_paths
+                if res_xy_out is None:
+                    self._resolution_is_xy.setdefault(dev_id, {})[profile_idx] = dev_res_xy
+                if res_map_out is None:
+                    self._resolution_maps[dev_id] = res_map
+
         if current_from_ratbag is not None:
             info.current = current_from_ratbag
 
         # ratbagd's value is stale when profile commits fail; the device itself is authoritative.
-        usb_id = self._usb_ids.get(dev_id)
+        if usb_id is None:
+            with self._topology_lock:
+                usb_id = self._usb_ids.get(dev_id)
         if usb_id:
             hw_dpi = hidpp.get_dpi(*usb_id)
             if hw_dpi and 50 <= hw_dpi <= 30000:
@@ -984,9 +1056,10 @@ class RatbagBackend(BaseBackend):
         vid: str = "",
         pid: str = "",
         profile_idx: int = 0,
+        btn_paths_out: Optional[Dict[int, str]] = None,
     ) -> List[ButtonMapping]:
         buttons: List[ButtonMapping] = []
-        dev_btn_paths = self._button_paths.setdefault(dev_id, {}).setdefault(profile_idx, {})
+        dev_btn_paths: Dict[int, str] = btn_paths_out if btn_paths_out is not None else {}
 
         parsed_entries: List[Tuple[int, str, str]] = []
         for i, btn_path in enumerate(btn_paths):
@@ -1008,6 +1081,10 @@ class RatbagBackend(BaseBackend):
                 act_val, act_disp = "button 1", "Left Click"
             parsed_entries.append((b_idx, act_val, act_disp))
 
+        if btn_paths_out is None:
+            with self._topology_lock:
+                self._button_paths.setdefault(dev_id, {})[profile_idx] = dev_btn_paths
+
         total_buttons = len(btn_paths) if btn_paths else len(parsed_entries)
         for b_idx, act_val, act_disp in sorted(parsed_entries, key=lambda item: item[0]):
             meta = get_button_metadata(dev_name, vid, pid, b_idx, act_val, total_buttons)
@@ -1026,7 +1103,8 @@ class RatbagBackend(BaseBackend):
         return buttons
 
     def set_dpi(self, device_id: str, dpi: int) -> bool:
-        usb_id = self._usb_ids.get(device_id)
+        with self._topology_lock:
+            usb_id = self._usb_ids.get(device_id)
         if usb_id and hidpp.set_dpi(*usb_id, dpi):
             return True
         if not self.is_available():
@@ -1040,18 +1118,20 @@ class RatbagBackend(BaseBackend):
             profile_idx, _hidpp_prof_id = self._resolve_active_profile(device_id)
             if profile_idx is None:
                 prof_map = self._ensure_device_profiles(device_id, dev_path)
-                profile_idx = self._active_profiles.get(device_id)
+                with self._topology_lock:
+                    profile_idx = self._active_profiles.get(device_id)
                 if profile_idx is None and prof_map:
                     profile_idx = sorted(prof_map.keys())[0]
             if profile_idx is None:
                 return False
 
             self._ensure_profile_topology(device_id, dev_path, profile_idx)
-            prof_res_paths = self._resolution_paths.get(device_id, {}).get(profile_idx, {})
-            prof_res_xy = self._resolution_is_xy.get(device_id, {}).get(profile_idx, {})
+            with self._topology_lock:
+                prof_res_paths = dict(self._resolution_paths.get(device_id, {}).get(profile_idx, {}))
+                prof_res_xy = dict(self._resolution_is_xy.get(device_id, {}).get(profile_idx, {}))
+                res_map = dict(self._resolution_maps.get(device_id, {}))
 
             # If the device has an existing resolution slot with this DPI, switch active resolution directly.
-            res_map = self._resolution_maps.get(device_id, {})
             if dpi in res_map:
                 slot_idx = res_map[dpi]
                 slot_path = prof_res_paths.get(slot_idx)
@@ -1157,14 +1237,16 @@ class RatbagBackend(BaseBackend):
             profile_idx, hidpp_profile_id = self._resolve_active_profile(device_id)
             if profile_idx is None:
                 prof_map = self._ensure_device_profiles(device_id, dev_path)
-                profile_idx = self._active_profiles.get(device_id)
+                with self._topology_lock:
+                    profile_idx = self._active_profiles.get(device_id)
                 if profile_idx is None and prof_map:
                     profile_idx = sorted(prof_map.keys())[0]
             if profile_idx is None:
                 return False
 
             self._ensure_profile_topology(device_id, dev_path, profile_idx)
-            btn_path = self._button_paths.get(device_id, {}).get(profile_idx, {}).get(button_idx)
+            with self._topology_lock:
+                btn_path = self._button_paths.get(device_id, {}).get(profile_idx, {}).get(button_idx)
             if not btn_path:
                 logger.warning("No ratbag button path found for %s profile %d button %d", device_id, profile_idx, button_idx)
                 return False
@@ -1216,7 +1298,8 @@ class RatbagBackend(BaseBackend):
                 target_profile_idx, hidpp_profile_id = self._resolve_active_profile(device_id)
                 if target_profile_idx is None:
                     prof_map = self._ensure_device_profiles(device_id, dev_path)
-                    target_profile_idx = self._active_profiles.get(device_id)
+                    with self._topology_lock:
+                        target_profile_idx = self._active_profiles.get(device_id)
                     if target_profile_idx is None and prof_map:
                         target_profile_idx = sorted(prof_map.keys())[0]
             else:
@@ -1227,7 +1310,8 @@ class RatbagBackend(BaseBackend):
                 return False
 
             self._ensure_profile_topology(device_id, dev_path, target_profile_idx)
-            btn_paths = self._button_paths.get(device_id, {}).get(target_profile_idx, {})
+            with self._topology_lock:
+                btn_paths = dict(self._button_paths.get(device_id, {}).get(target_profile_idx, {}))
 
             written = 0
             for idx, encoded in valid_items:
@@ -1280,7 +1364,8 @@ class RatbagBackend(BaseBackend):
                     logger.debug("Could not enable profile 1 on %s during reset: %s", device_id, exc)
 
             dev = self._inspect_device(device_id, dev_path)
-            cached_vid, cached_pid = self._usb_ids.get(device_id, ("", ""))
+            with self._topology_lock:
+                cached_vid, cached_pid = self._usb_ids.get(device_id, ("", ""))
             dev_name = dev.name if dev else ""
             vid = (dev.usb_vid if dev and dev.usb_vid else cached_vid) or ""
             pid = (dev.usb_pid if dev and dev.usb_pid else cached_pid) or ""
@@ -1297,7 +1382,10 @@ class RatbagBackend(BaseBackend):
             self.batch_remap_buttons(device_id, defaults)
 
             # Ensure profile 0 also has valid mappings to prevent broken fallback
-            if 0 in self._profile_paths.get(device_id, {}) and self._active_profiles.get(device_id) != 0:
+            with self._topology_lock:
+                has_prof_0 = 0 in self._profile_paths.get(device_id, {})
+                active_prof = self._active_profiles.get(device_id)
+            if has_prof_0 and active_prof != 0:
                 self.batch_remap_buttons(device_id, defaults, profile_idx=0)
 
             target_dpi = 1600 if (dev and dev.dpi and 1600 in dev.dpi.steps) else 800

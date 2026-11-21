@@ -97,6 +97,10 @@ class TestMouseProfiles(unittest.TestCase):
         self.assertEqual(act, "unknown")
         self.assertEqual(disp, "Default / Unknown")
 
+        act, disp = parse_button_action("unknown")
+        self.assertEqual(act, "unknown")
+        self.assertEqual(disp, "Default / Unknown")
+
         # Macro parsing
         act, disp = parse_button_action("macro '↓KEY_LEFTCTRL ↕KEY_C ↑KEY_LEFTCTRL'")
         self.assertEqual(act, "macro +KEY_LEFTCTRL KEY_C -KEY_LEFTCTRL")

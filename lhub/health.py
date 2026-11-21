@@ -157,7 +157,43 @@ def check_ratbagd(dbus_client: Optional[SystemDBusClient] = None) -> HealthCheck
                 fix_hint="",
             )
 
-        if client.is_service_activatable(RATBAG_SERVICE) or bool(shutil.which("ratbagd")):
+        if client.is_service_activatable(RATBAG_SERVICE):
+            try:
+                client.start_service_by_name(RATBAG_SERVICE)
+                client.get_property(
+                    RATBAG_SERVICE,
+                    RATBAG_MANAGER_PATH,
+                    RATBAG_MANAGER_IFACE,
+                    "APIVersion",
+                )
+                return HealthCheckItem(
+                    id="ratbagd",
+                    severity=SEVERITY_OK,
+                    title="ratbagd is running",
+                    description="libratbag daemon is reachable via D-Bus.",
+                    fix_hint="",
+                )
+            except DBusTimeoutError:
+                return HealthCheckItem(
+                    id="ratbagd",
+                    severity=SEVERITY_ERROR,
+                    title="ratbagd service is not responding",
+                    description="Timed out waiting for ratbagd on system D-Bus.",
+                    fix_hint=RATBAGD_FIX_HINT,
+                )
+            except DBusError:
+                return HealthCheckItem(
+                    id="ratbagd",
+                    severity=SEVERITY_ERROR,
+                    title="ratbagd service is not running",
+                    description=(
+                        f"Could not connect to {RATBAG_SERVICE} on system D-Bus. "
+                        "Mouse configuration is unavailable."
+                    ),
+                    fix_hint=RATBAGD_FIX_HINT,
+                )
+
+        if bool(shutil.which("ratbagd")):
             return HealthCheckItem(
                 id="ratbagd",
                 severity=SEVERITY_ERROR,

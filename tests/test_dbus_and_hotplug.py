@@ -10,7 +10,7 @@ from PySide6.QtCore import QEventLoop, QTimer
 from PySide6.QtDBus import QDBusArgument, QDBusObjectPath, QDBusVariant
 from PySide6.QtGui import QGuiApplication
 from jeepney.low_level import HeaderFields, MessageFlag
-from jeepney.wrappers import new_error, new_method_return
+from jeepney.wrappers import DBusErrorResponse, new_error, new_method_return
 
 from lhub.backends.base import BaseBackend, BatteryInfo, Capability, Device, DeviceType
 from lhub.backends.dbus_client import (
@@ -285,6 +285,28 @@ class TestSystemDBusClient(unittest.TestCase):
         fake_bus.disconnect.assert_called_once()
         self.assertFalse(client.unsubscribe_signal(sub_id))
 
+    def test_open_connection_handles_auth_and_hello_errors(self):
+        for exc in (ValueError("bad address"), StopIteration("eof"), DBusErrorResponse(MagicMock())):
+            client = SystemDBusClient()
+            with patch("lhub.backends.dbus_client.open_dbus_connection", side_effect=exc):
+                self.assertFalse(client.is_bus_available())
+
+    def test_start_service_by_name_sets_auto_start_flag(self):
+        sent = []
+
+        def fake_send(msg, timeout=None):
+            sent.append(msg)
+            return new_method_return(msg, "u", (1,))
+
+        fake_conn = MagicMock()
+        fake_conn.send_and_get_reply.side_effect = fake_send
+        client = SystemDBusClient(connection_factory=lambda: fake_conn)
+
+        reply = client.start_service_by_name(RATBAG_SERVICE)
+        self.assertEqual(reply, 1)
+        self.assertEqual(len(sent), 1)
+        self.assertFalse(bool(sent[0].header.flags & MessageFlag.no_auto_start))
+
 
 class TestEvdevCodes(unittest.TestCase):
     def test_roundtrip_and_unknown_key(self):
@@ -346,6 +368,91 @@ class TestRatbagHotplugSignals(unittest.TestCase):
 
         backend.stop_monitoring()
         self.assertEqual(dbus.unsubscribe_signal.call_count, 5)
+
+    def test_ratbag_on_demand_dbus_activation_and_failure_caching(self):
+        dbus = MagicMock()
+        dbus.is_bus_available.return_value = True
+        dbus.has_name_owner.return_value = False
+        dbus.is_service_activatable.return_value = True
+        dbus.start_service_by_name.return_value = 1
+
+        backend = RatbagBackend(dbus_client=dbus)
+        self.assertTrue(backend.is_available())
+        dbus.start_service_by_name.assert_called_once_with(RATBAG_SERVICE)
+
+        # Activation failure is cached until NameOwnerChanged resets it
+        dbus.start_service_by_name.reset_mock()
+        dbus.start_service_by_name.side_effect = DBusCallError(
+            "org.freedesktop.systemd1.NoSuchUnit",
+            "unit disabled",
+        )
+        callbacks = []
+        dbus.subscribe_signal.side_effect = lambda svc, path, iface, sig, cb: callbacks.append((iface, sig, cb)) or len(callbacks)
+        backend.start_monitoring(lambda: None)
+
+        self.assertFalse(backend.is_available())
+        self.assertFalse(backend.is_available())
+        dbus.start_service_by_name.assert_called_once_with(RATBAG_SERVICE)
+
+        dbus.start_service_by_name.side_effect = None
+        for iface, sig, cb in callbacks:
+            if (iface, sig) == ("org.freedesktop.DBus", "NameOwnerChanged"):
+                cb(DBusSignalEvent("org.freedesktop.DBus", "/org/freedesktop/DBus", "org.freedesktop.DBus", "NameOwnerChanged", (RATBAG_SERVICE, "", ":1.9")))
+        self.assertTrue(backend.is_available())
+        self.assertEqual(dbus.start_service_by_name.call_count, 2)
+
+    def test_inspect_device_preserves_topology_if_inspection_fails(self):
+        dbus = MagicMock()
+        dev_path = "/org/freedesktop/ratbag1/device/hidraw6"
+        p0_path = "/org/freedesktop/ratbag1/profile/hidraw6/p0"
+        b0_path = "/org/freedesktop/ratbag1/button/hidraw6/p0/b0"
+        r0_path = "/org/freedesktop/ratbag1/resolution/hidraw6/p0/r0"
+
+        props_map = {
+            (dev_path, RATBAG_DEVICE_IFACE): {
+                "Name": "Logitech G502 X",
+                "Model": "usb:046d:c099:0",
+                "DeviceType": 1,
+                "Profiles": [p0_path],
+            },
+            (p0_path, "org.freedesktop.ratbag1.Profile"): {
+                "Index": 0,
+                "Disabled": False,
+                "IsActive": True,
+                "Resolutions": [r0_path],
+                "Buttons": [b0_path],
+            },
+            (r0_path, "org.freedesktop.ratbag1.Resolution"): {
+                "Index": 0,
+                "Resolution": ("u", 800),
+                "Resolutions": [800],
+                "IsDisabled": False,
+                "IsActive": True,
+            },
+            (b0_path, "org.freedesktop.ratbag1.Button"): {
+                "Index": 0,
+                "Mapping": (1, ("u", 1)),
+            },
+        }
+        dbus.get_all_properties.side_effect = lambda _s, p, i: dict(props_map[(p, i)])
+
+        backend = RatbagBackend(dbus_client=dbus)
+        with patch("lhub.backends.ratbag.hidpp.get_onboard_profile", return_value=None), \
+             patch("lhub.backends.ratbag.hidpp.get_dpi", return_value=None):
+            dev = backend._inspect_device("ratbag_hidraw6", dev_path)
+            self.assertIsNotNone(dev)
+            self.assertEqual(backend._button_paths["ratbag_hidraw6"][0][0], b0_path)
+
+            # Subsequent failing inspection must NOT wipe previously cached button/resolution paths
+            def fail_midway(_s, path, iface):
+                if path == p0_path:
+                    raise DBusUnavailableError("bus restarted")
+                return dict(props_map[(path, iface)])
+
+            dbus.get_all_properties.side_effect = fail_midway
+            self.assertIsNone(backend._inspect_device("ratbag_hidraw6", dev_path))
+            self.assertEqual(backend._button_paths["ratbag_hidraw6"][0][0], b0_path)
+            self.assertEqual(backend._resolution_paths["ratbag_hidraw6"][0][0], r0_path)
 
 
 class _DummyHotplugBackend(BaseBackend):
@@ -487,6 +594,29 @@ class TestDeviceManagerHotplugAndDebounce(unittest.TestCase):
         self.assertFalse(mgr._timer.isActive())
         self.assertFalse(mgr._hotplug_debounce_timer.isActive())
         self.assertTrue(hp.stopped)
+
+    def test_main_thread_polling_and_missing_backends_do_not_probe_monitored_hotplug_backends(self):
+        hp = _DummyHotplugBackend("ratbagd")
+        hp.is_available = MagicMock(return_value=False)
+        hp.get_missing_reason = MagicMock(return_value="ratbagd offline")
+        cli = _DummyPollingBackend("headsetcontrol")
+
+        mgr = DeviceManager(auto_refresh=False, backends=[hp, cli], enable_hotplug=True)
+        self.addCleanup(mgr.cleanup)
+
+        # Polling selection & QML missingBackends must not call is_available() on monitored hotplug backend
+        polling = mgr._get_polling_backends()
+        self.assertEqual(polling, [cli])
+        self.assertEqual(mgr.missingBackends, [])
+        hp.is_available.assert_not_called()
+
+        # Worker checks is_available() off-thread and caches missingBackends cleanly
+        with patch.object(mgr, "_update_health_checks", return_value=[]):
+            mgr._scan_worker()
+        self.assertEqual(hp.is_available.call_count, 1)
+        self.assertEqual(mgr.missingBackends, ["ratbagd offline"])
+        # Reading property again must not re-probe backend
+        self.assertEqual(hp.is_available.call_count, 1)
 
 
 if __name__ == "__main__":

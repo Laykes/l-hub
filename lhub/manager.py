@@ -75,6 +75,8 @@ class DeviceManager(QObject):
         self._devices: List[Device] = []
         self._cached_dict_devices: List[Dict[str, Any]] = []
         self._backend_devices: Dict[str, List[Device]] = {}
+        self._backend_missing_reasons: Dict[str, str] = {}
+        self._missing_backends: List[str] = []
         self._monitored_backends: List[BaseBackend] = []
         self._health_checks: List[Dict[str, Any]] = []
         self._last_health_signature: Optional[Tuple[Tuple[str, str, str, str], ...]] = None
@@ -152,11 +154,15 @@ class DeviceManager(QObject):
 
     def _get_polling_backends(self) -> List[BaseBackend]:
         monitored_ids = {id(b) for b in self._monitored_backends}
-        return [
-            b
-            for b in self.backends
-            if b.is_available() and (not b.supports_hotplug or id(b) not in monitored_ids)
-        ]
+        polling: List[BaseBackend] = []
+        for b in self.backends:
+            if b.supports_hotplug and id(b) in monitored_ids:
+                continue
+            # Avoid blocking D-Bus/IPC probes on the Qt main thread for unmonitored hotplug backends;
+            # _scan_worker checks is_available() off-thread.
+            if b.supports_hotplug or b.is_available():
+                polling.append(b)
+        return polling
 
     def _on_poll_timeout(self) -> None:
         polling_backends = self._get_polling_backends()
@@ -187,6 +193,7 @@ class DeviceManager(QObject):
             targets = list(self.backends) if backends_to_scan is None else list(backends_to_scan)
             for b in targets:
                 if b.is_available():
+                    self._backend_missing_reasons.pop(b.name, None)
                     try:
                         devs = b.scan_devices()
                         self._backend_devices[b.name] = list(devs)
@@ -200,7 +207,15 @@ class DeviceManager(QObject):
                         )
                 else:
                     self._backend_devices[b.name] = []
-                    logger.debug("Backend %s unavailable: %s", b.name, b.get_missing_reason() or "not found")
+                    raw_reason = b.get_missing_reason()
+                    self._backend_missing_reasons[b.name] = raw_reason
+                    logger.debug("Backend %s unavailable: %s", b.name, raw_reason or "not found")
+
+            self._missing_backends = [
+                self._backend_missing_reasons[b.name]
+                for b in self.backends
+                if self._backend_missing_reasons.get(b.name)
+            ]
 
             detected: List[Device] = []
             for b in self.backends:
@@ -384,13 +399,7 @@ class DeviceManager(QObject):
 
     @Property("QVariantList", notify=statusChanged)
     def missingBackends(self) -> List[str]:
-        missing = []
-        for b in self.backends:
-            if not b.is_available():
-                msg = b.get_missing_reason()
-                if msg:
-                    missing.append(msg)
-        return missing
+        return list(self._missing_backends)
 
     def _update_health_checks(self, devices: Optional[List[Device]] = None) -> List[Dict[str, Any]]:
         items = run_health_checks(devices=devices, log_results=False)
