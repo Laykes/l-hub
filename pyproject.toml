@@ -28,4 +28,4 @@ where = ["."]
 include = ["lhub*"]
 
 [tool.setuptools.package-data]
-lhub = ["qml/*.qml", "assets/*.svg"]
+lhub = ["qml/*.qml", "qml/components/*.qml", "assets/*.svg"]
