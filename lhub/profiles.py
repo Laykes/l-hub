@@ -161,3 +161,62 @@ class ProfileManager:
             dev_profiles["Standard"] = data.copy()
         self._data["active_profiles"][device_key] = DEFAULT_PROFILE
         self._save()
+
+    @staticmethod
+    def _clone_mic_config(mic_config: Dict[str, Any]) -> Dict[str, Any]:
+        cloned = dict(mic_config)
+        if isinstance(cloned.get("bands"), dict):
+            cloned["bands"] = dict(cloned["bands"])
+        return cloned
+
+    def save_mic_profile(
+        self,
+        device_key: str,
+        profile_name: str,
+        mic_config: Dict[str, Any],
+    ):
+        profile_name = profile_name.strip()
+        if not profile_name:
+            return
+        dev_profiles = self._data["profiles"].setdefault(device_key, {})
+        dev_profiles[profile_name] = {"microphone": self._clone_mic_config(mic_config)}
+        self._data["active_profiles"][device_key] = profile_name
+        self._save()
+
+    def update_active_mic_config(
+        self,
+        device_key: str,
+        mic_config: Dict[str, Any],
+    ):
+        active = self.get_active_profile(device_key)
+        dev_profiles = self._data["profiles"].setdefault(device_key, {})
+        prof_data = dev_profiles.setdefault(active, {})
+        prof_data["microphone"] = self._clone_mic_config(mic_config)
+        self._save()
+
+    def ensure_default_mic_profile(
+        self,
+        device_key: str,
+        mic_config: Dict[str, Any],
+    ):
+        dev_profiles = self._data["profiles"].get(device_key, {})
+        if not any(p in dev_profiles for p in PROTECTED_PROFILES):
+            self._data["profiles"].setdefault(device_key, {})[DEFAULT_PROFILE] = {
+                "microphone": self._clone_mic_config(mic_config)
+            }
+            if device_key not in self._data["active_profiles"]:
+                self._data["active_profiles"][device_key] = DEFAULT_PROFILE
+            self._save()
+
+    def reset_mic_to_default(
+        self,
+        device_key: str,
+        mic_config: Dict[str, Any],
+    ):
+        cloned = self._clone_mic_config(mic_config)
+        dev_profiles = self._data["profiles"].setdefault(device_key, {})
+        dev_profiles[DEFAULT_PROFILE] = {"microphone": cloned}
+        if "Standard" in dev_profiles:
+            dev_profiles["Standard"] = {"microphone": self._clone_mic_config(mic_config)}
+        self._data["active_profiles"][device_key] = DEFAULT_PROFILE
+        self._save()

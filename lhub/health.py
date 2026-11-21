@@ -81,6 +81,9 @@ def _discover_relevant_hidraw_nodes(
     known_pairs: Set[Tuple[str, str]] = set()
     if devices:
         for dev in devices:
+            dev_type = getattr(dev, "device_type", None)
+            if getattr(dev_type, "value", dev_type) == "microphone":
+                continue
             d_vid = (getattr(dev, "usb_vid", None) or "").strip().lower()
             d_pid = (getattr(dev, "usb_pid", None) or "").strip().lower()
             if d_vid and d_pid:

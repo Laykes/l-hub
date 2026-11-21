@@ -10,11 +10,23 @@ from PySide6.QtGui import QGuiApplication
 
 from .backends import (
     BaseBackend,
+    Capability,
     Device,
+    DeviceType,
     HeadsetBackend,
+    PipeWireMicBackend,
     RatbagBackend,
     UPowerBackend,
     hidpp,
+)
+from .backends.microphone import (
+    apply_config_to_mic_info,
+    clamp_eq_gain,
+    clamp_hpf_freq,
+    clamp_mic_volume,
+    create_default_eq_bands,
+    get_builtin_eq_preset,
+    mic_info_to_config,
 )
 from .backends.ratbag import parse_button_action
 from .button_tester import ButtonTesterController
@@ -23,7 +35,13 @@ from .health import SEVERITY_ERROR, log_health_checks, run_health_checks
 from .keymap import resolve_key_action
 from .profiles import ProfileManager
 from .serializers import device_to_dict, get_device_key
-from .settings import SettingsManager
+from .settings import (
+    HEADSET_INACTIVE_TIME_MAX,
+    HEADSET_INACTIVE_TIME_MIN,
+    HEADSET_SIDETONE_MAX,
+    HEADSET_SIDETONE_MIN,
+    SettingsManager,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -54,6 +72,7 @@ class DeviceManager(QObject):
 
     LOW_BATTERY_HYSTERESIS = 5
     HOTPLUG_DEBOUNCE_MS = 400
+    HEADSET_RESTORE_MAX_RETRIES = 2
 
     devicesChanged = Signal()
     statusChanged = Signal()
@@ -85,6 +104,7 @@ class DeviceManager(QObject):
             else [
                 HeadsetBackend(),
                 RatbagBackend(),
+                PipeWireMicBackend(),
                 UPowerBackend(),
             ]
         )
@@ -101,6 +121,16 @@ class DeviceManager(QObject):
         self._warned_devices: Set[str] = set()
         self._hidpp_monitors: Dict[str, hidpp.OnboardProfileMonitor] = {}
         self._monitors_lock = threading.Lock()
+        self._headset_lock = threading.Lock()
+        self._headset_io_lock = threading.Lock()
+        self._applied_headset_keys: Set[str] = set()
+        self._headset_restore_failures: Dict[str, int] = {}
+        self._headset_cmd_seq: Dict[Tuple[str, str], int] = {}
+        self._mic_lock = threading.Lock()
+        self._mic_io_lock = threading.Lock()
+        self._applied_mic_keys: Set[str] = set()
+        self._mic_eq_seq: Dict[str, int] = {}
+        self._mic_vol_seq: Dict[str, int] = {}
 
         self._hidppProfileEvent.connect(self._on_hidpp_profile_event)
         self._hidppDpiEvent.connect(self._on_hidpp_dpi_event)
@@ -249,6 +279,12 @@ class DeviceManager(QObject):
                     dpi_val = d.dpi.current if (d.dpi and not d.dpi.is_disabled) else None
                     self.profile_mgr.ensure_default_profile(dev_key, b_map, dpi_val)
 
+            # Overlay persisted headset settings and restore on startup / reconnect
+            self._sync_headset_settings(merged)
+
+            # Ensure default profiles & restore PipeWire EQ for USB microphones
+            self._sync_microphone_settings(merged)
+
             # Check low battery warnings
             self._check_battery_warnings(merged)
 
@@ -265,6 +301,165 @@ class DeviceManager(QObject):
         finally:
             self._is_scanning = False
             self._scanFinished.emit()
+
+    @staticmethod
+    def _is_configurable_headset(dev: Device) -> bool:
+        return (
+            dev.device_type == DeviceType.HEADSET
+            and (
+                Capability.SIDETONE in dev.capabilities
+                or Capability.INACTIVE_TIME in dev.capabilities
+            )
+        )
+
+    @classmethod
+    def _is_headset_online(cls, dev: Device) -> bool:
+        if not cls._is_configurable_headset(dev):
+            return False
+        if Capability.BATTERY in dev.capabilities:
+            return bool(dev.battery is not None and dev.battery.is_supported)
+        return True
+
+    @staticmethod
+    def _fallback_headset_key(device_id: str) -> str:
+        if device_id.startswith("headset_"):
+            parts = device_id.split("_")
+            if len(parts) >= 3 and len(parts[1]) == 4 and len(parts[2]) == 4:
+                return f"{parts[1].lower()}:{parts[2].lower()}"
+        return device_id
+
+    def _get_headset_backends(self) -> List[HeadsetBackend]:
+        return [b for b in self.backends if isinstance(b, HeadsetBackend)]
+
+    def _sync_headset_settings(self, devices: List[Device]) -> None:
+        headsets = [d for d in devices if self._is_configurable_headset(d)]
+        online_keys = {get_device_key(d) for d in headsets if self._is_headset_online(d)}
+
+        with self._headset_lock:
+            self._applied_headset_keys.intersection_update(online_keys)
+            for stale_key in list(self._headset_restore_failures):
+                if stale_key not in online_keys:
+                    del self._headset_restore_failures[stale_key]
+
+        headset_backends = self._get_headset_backends()
+
+        for dev in headsets:
+            dev_key = get_device_key(dev)
+            saved = self.settings_mgr.get_headset_settings(dev_key)
+
+            if Capability.SIDETONE in dev.capabilities and "sidetone" in saved:
+                dev.sidetone = saved["sidetone"]
+            if Capability.INACTIVE_TIME in dev.capabilities and "inactive_time" in saved:
+                dev.inactive_time = saved["inactive_time"]
+
+            if dev_key not in online_keys:
+                continue
+
+            with self._headset_lock:
+                if dev_key in self._applied_headset_keys:
+                    continue
+                if self._headset_restore_failures.get(dev_key, 0) >= self.HEADSET_RESTORE_MAX_RETRIES:
+                    continue
+
+            has_saved_applicable = (
+                (Capability.SIDETONE in dev.capabilities and "sidetone" in saved)
+                or (Capability.INACTIVE_TIME in dev.capabilities and "inactive_time" in saved)
+            )
+            if not has_saved_applicable:
+                with self._headset_lock:
+                    self._applied_headset_keys.add(dev_key)
+                continue
+
+            if not headset_backends:
+                continue
+
+            applied_summary: Dict[str, int] = {}
+            all_ok = True
+            with self._headset_io_lock:
+                latest_saved = self.settings_mgr.get_headset_settings(dev_key)
+                if Capability.SIDETONE in dev.capabilities and "sidetone" in latest_saved:
+                    target_val = latest_saved["sidetone"]
+                    dev.sidetone = target_val
+                    ok = any(b.set_sidetone(dev.id, target_val) for b in headset_backends)
+                    if ok:
+                        applied_summary["sidetone"] = target_val
+                    else:
+                        all_ok = False
+                if Capability.INACTIVE_TIME in dev.capabilities and "inactive_time" in latest_saved:
+                    target_val = latest_saved["inactive_time"]
+                    dev.inactive_time = target_val
+                    ok = any(b.set_inactive_time(dev.id, target_val) for b in headset_backends)
+                    if ok:
+                        applied_summary["inactive_time"] = target_val
+                    else:
+                        all_ok = False
+
+            with self._headset_lock:
+                if all_ok:
+                    self._applied_headset_keys.add(dev_key)
+                    self._headset_restore_failures.pop(dev_key, None)
+                    if applied_summary:
+                        logger.info(
+                            "Restored headset settings for %s (%s): %s",
+                            dev.name,
+                            dev_key,
+                            applied_summary,
+                        )
+                else:
+                    self._headset_restore_failures[dev_key] = (
+                        self._headset_restore_failures.get(dev_key, 0) + 1
+                    )
+                    logger.debug(
+                        "Failed to restore headset settings for %s (%s); attempt %d/%d",
+                        dev.name,
+                        dev_key,
+                        self._headset_restore_failures[dev_key],
+                        self.HEADSET_RESTORE_MAX_RETRIES,
+                    )
+
+    def _get_mic_backends(self) -> List[PipeWireMicBackend]:
+        return [b for b in self.backends if isinstance(b, PipeWireMicBackend)]
+
+    def _sync_microphone_settings(self, devices: List[Device]) -> None:
+        mics = [d for d in devices if d.device_type == DeviceType.MICROPHONE and d.microphone is not None]
+        online_keys = {get_device_key(d) for d in mics}
+
+        with self._mic_lock:
+            self._applied_mic_keys.intersection_update(online_keys)
+
+        mic_backends = self._get_mic_backends()
+
+        for dev in mics:
+            assert dev.microphone is not None
+            dev_key = get_device_key(dev)
+            self.profile_mgr.ensure_default_mic_profile(dev_key, mic_info_to_config(dev.microphone))
+
+            active_name = self.profile_mgr.get_active_profile(dev_key)
+            prof_data = self.profile_mgr.get_profile_data(dev_key, active_name)
+            mic_cfg = prof_data.get("microphone") if isinstance(prof_data, dict) else None
+            if isinstance(mic_cfg, dict):
+                # Overlay saved EQ/HPF settings while preserving live PipeWire volume/mute/flags
+                eq_only = {k: v for k, v in mic_cfg.items() if k != "volume"}
+                apply_config_to_mic_info(dev.microphone, eq_only)
+
+            with self._mic_lock:
+                already_applied = dev_key in self._applied_mic_keys
+
+            if already_applied or not mic_backends:
+                continue
+
+            applied = False
+            with self._mic_io_lock:
+                for backend in mic_backends:
+                    if backend.apply_eq(dev.id, dev.microphone):
+                        applied = True
+                        break
+
+            if applied:
+                dev.microphone.virtual_source_active = True
+                with self._mic_lock:
+                    self._applied_mic_keys.add(dev_key)
+                logger.info("Activated PipeWire EQ filter-chain for %s (%s)", dev.name, dev_key)
 
     def _check_battery_warnings(self, devices: List[Device]):
         threshold = self.settings_mgr.low_battery_threshold
@@ -381,6 +576,11 @@ class DeviceManager(QObject):
         self._pending_refresh = False
         self._stop_backend_monitors()
         self._button_tester.cleanup()
+        for backend in self.backends:
+            try:
+                backend.cleanup()
+            except Exception as exc:
+                logger.debug("Backend %s cleanup failed: %s", backend.name, exc)
         with self._monitors_lock:
             for mon in self._hidpp_monitors.values():
                 mon.stop()
@@ -555,21 +755,267 @@ class DeviceManager(QObject):
         threading.Thread(target=_worker, daemon=True).start()
         return True
 
-    @Slot(str, int)
-    def setSidetone(self, device_id: str, level: int):
-        # Update local cache immediately
+    def _apply_headset_setting(self, device_id: str, setting_key: str, value: int) -> None:
+        if setting_key == "sidetone":
+            clamped = max(HEADSET_SIDETONE_MIN, min(HEADSET_SIDETONE_MAX, int(value)))
+            dict_key = "sidetone"
+        elif setting_key == "inactive_time":
+            clamped = max(HEADSET_INACTIVE_TIME_MIN, min(HEADSET_INACTIVE_TIME_MAX, int(value)))
+            dict_key = "inactiveTime"
+        else:
+            return
+
+        dev = self._get_device_by_id(device_id)
+        if dev is not None:
+            if setting_key == "sidetone":
+                dev.sidetone = clamped
+            else:
+                dev.inactive_time = clamped
+            dev_key = get_device_key(dev)
+            is_offline = not self._is_headset_online(dev)
+        else:
+            dev_key = self._fallback_headset_key(device_id)
+            is_offline = False
+
+        # Update local cache immediately for responsive UI
         for d in self._cached_dict_devices:
             if d["id"] == device_id:
-                d["sidetone"] = level
+                d[dict_key] = clamped
                 self.devicesChanged.emit()
                 break
 
+        cmd_id = (dev_key, setting_key)
+        with self._headset_lock:
+            seq = self._headset_cmd_seq.get(cmd_id, 0) + 1
+            self._headset_cmd_seq[cmd_id] = seq
+
         def _worker():
-            for b in self.backends:
-                if isinstance(b, HeadsetBackend):
-                    b.set_sidetone(device_id, level)
+            with self._headset_io_lock:
+                with self._headset_lock:
+                    if self._headset_cmd_seq.get(cmd_id) != seq:
+                        return
+                applied = False
+                for b in self._get_headset_backends():
+                    if setting_key == "sidetone":
+                        if b.set_sidetone(device_id, clamped):
+                            applied = True
+                    else:
+                        if b.set_inactive_time(device_id, clamped):
+                            applied = True
+
+                with self._headset_lock:
+                    if self._headset_cmd_seq.get(cmd_id) != seq:
+                        return
+                    if applied:
+                        self._headset_restore_failures.pop(dev_key, None)
+
+                if applied or is_offline:
+                    self.settings_mgr.set_headset_setting(dev_key, setting_key, clamped)
 
         threading.Thread(target=_worker, daemon=True).start()
+
+    @Slot(str, int)
+    def setSidetone(self, device_id: str, level: int):
+        self._apply_headset_setting(device_id, "sidetone", level)
+
+    @Slot(str, int)
+    def setInactiveTime(self, device_id: str, minutes: int):
+        self._apply_headset_setting(device_id, "inactive_time", minutes)
+
+    def _update_cached_mic_entry(self, dev: Device) -> None:
+        updated_dict = self._device_to_dict(dev)
+        for idx, entry in enumerate(self._cached_dict_devices):
+            if entry.get("id") == dev.id:
+                self._cached_dict_devices[idx] = updated_dict
+                self.devicesChanged.emit()
+                break
+
+    def _push_mic_eq_async(self, dev: Device, persist_active: bool = True) -> None:
+        if dev.microphone is None:
+            return
+        dev_key = get_device_key(dev)
+        mic_snapshot = replace(dev.microphone, bands=[replace(b) for b in dev.microphone.bands])
+        if persist_active:
+            self.profile_mgr.update_active_mic_config(dev_key, mic_info_to_config(mic_snapshot))
+
+        with self._mic_lock:
+            seq = self._mic_eq_seq.get(dev.id, 0) + 1
+            self._mic_eq_seq[dev.id] = seq
+
+        def _worker():
+            with self._mic_io_lock:
+                with self._mic_lock:
+                    if self._mic_eq_seq.get(dev.id) != seq:
+                        return
+                applied = False
+                for backend in self._get_mic_backends():
+                    if backend.apply_eq(dev.id, mic_snapshot):
+                        applied = True
+                        break
+                if applied and dev.microphone is not None and not dev.microphone.virtual_source_active:
+                    dev.microphone.virtual_source_active = True
+                    self._update_cached_mic_entry(dev)
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+    @Slot(str, int, result=bool)
+    def setMicVolume(self, device_id: str, volume: int) -> bool:
+        dev = self._get_device_by_id(device_id)
+        if not dev or dev.microphone is None:
+            return False
+        clamped = clamp_mic_volume(volume)
+        dev.microphone.volume = clamped
+        self._update_cached_mic_entry(dev)
+        dev_key = get_device_key(dev)
+        self.profile_mgr.update_active_mic_config(dev_key, mic_info_to_config(dev.microphone))
+
+        with self._mic_lock:
+            seq = self._mic_vol_seq.get(device_id, 0) + 1
+            self._mic_vol_seq[device_id] = seq
+
+        def _worker():
+            with self._mic_io_lock:
+                with self._mic_lock:
+                    if self._mic_vol_seq.get(device_id) != seq:
+                        return
+                for backend in self._get_mic_backends():
+                    if backend.set_volume(device_id, clamped):
+                        break
+
+        threading.Thread(target=_worker, daemon=True).start()
+        return True
+
+    @Slot(str, bool, result=bool)
+    def setMicMuted(self, device_id: str, muted: bool) -> bool:
+        dev = self._get_device_by_id(device_id)
+        if not dev or dev.microphone is None:
+            return False
+        target_muted = bool(muted)
+        dev.microphone.muted = target_muted
+        self._update_cached_mic_entry(dev)
+
+        def _worker():
+            with self._mic_io_lock:
+                for backend in self._get_mic_backends():
+                    if backend.set_mute(device_id, target_muted):
+                        break
+
+        threading.Thread(target=_worker, daemon=True).start()
+        return True
+
+    @Slot(str, bool, result=bool)
+    def setMicEqEnabled(self, device_id: str, enabled: bool) -> bool:
+        dev = self._get_device_by_id(device_id)
+        if not dev or dev.microphone is None:
+            return False
+        dev.microphone.eq_enabled = bool(enabled)
+        self._update_cached_mic_entry(dev)
+        self._push_mic_eq_async(dev)
+        return True
+
+    @Slot(str, bool, int, result=bool)
+    def setMicHighpass(self, device_id: str, enabled: bool, freq: int) -> bool:
+        dev = self._get_device_by_id(device_id)
+        if not dev or dev.microphone is None:
+            return False
+        dev.microphone.highpass_enabled = bool(enabled)
+        dev.microphone.highpass_freq = clamp_hpf_freq(freq)
+        self._update_cached_mic_entry(dev)
+        self._push_mic_eq_async(dev)
+        return True
+
+    @Slot(str, str, float, result=bool)
+    def setMicEqBand(self, device_id: str, band_id: str, gain: float) -> bool:
+        dev = self._get_device_by_id(device_id)
+        if not dev or dev.microphone is None:
+            return False
+        clamped = clamp_eq_gain(gain)
+        found = False
+        for band in dev.microphone.bands:
+            if band.id == band_id:
+                band.gain = clamped
+                found = True
+                break
+        if not found:
+            return False
+        self._update_cached_mic_entry(dev)
+        self._push_mic_eq_async(dev)
+        return True
+
+    @Slot(str, str, result=bool)
+    def applyMicPreset(self, device_id: str, preset_name: str) -> bool:
+        dev = self._get_device_by_id(device_id)
+        if not dev or dev.microphone is None:
+            return False
+        preset = get_builtin_eq_preset(preset_name)
+        if preset is None:
+            return False
+        dev.microphone.eq_enabled = True
+        dev.microphone.highpass_enabled = bool(preset["highpass_enabled"])
+        dev.microphone.highpass_freq = clamp_hpf_freq(preset["highpass_freq"])
+        band_gains = preset.get("bands", {})
+        if not dev.microphone.bands:
+            dev.microphone.bands = create_default_eq_bands(band_gains)
+        else:
+            for band in dev.microphone.bands:
+                if band.id in band_gains:
+                    band.gain = clamp_eq_gain(band_gains[band.id])
+        self._update_cached_mic_entry(dev)
+        self._push_mic_eq_async(dev)
+        return True
+
+    @Slot(str, bool, result=bool)
+    def setMicMonitoring(self, device_id: str, enabled: bool) -> bool:
+        dev = self._get_device_by_id(device_id)
+        if not dev or dev.microphone is None:
+            return False
+        target = bool(enabled)
+        # Only one microphone monitor can be active at a time
+        for other in self._devices:
+            if other.microphone is not None and other.id != device_id and other.microphone.monitoring:
+                other.microphone.monitoring = False
+                self._update_cached_mic_entry(other)
+        dev.microphone.monitoring = target
+        self._update_cached_mic_entry(dev)
+
+        def _worker():
+            with self._mic_io_lock:
+                ok = False
+                for backend in self._get_mic_backends():
+                    if backend.set_monitoring(device_id, target):
+                        ok = True
+                        break
+                if not ok and target:
+                    dev.microphone.monitoring = False
+                    self._update_cached_mic_entry(dev)
+                elif ok and target and not dev.microphone.virtual_source_active:
+                    dev.microphone.virtual_source_active = True
+                    self._update_cached_mic_entry(dev)
+
+        threading.Thread(target=_worker, daemon=True).start()
+        return True
+
+    @Slot(str, bool, result=bool)
+    def setMicAsDefault(self, device_id: str, use_eq_source: bool = True) -> bool:
+        dev = self._get_device_by_id(device_id)
+        if not dev or dev.microphone is None:
+            return False
+
+        def _worker():
+            with self._mic_io_lock:
+                ok = False
+                for backend in self._get_mic_backends():
+                    if backend.set_default_source(device_id, use_eq_source=bool(use_eq_source)):
+                        ok = True
+                        break
+                if ok and dev.microphone is not None:
+                    dev.microphone.virtual_source_active = bool(use_eq_source) or dev.microphone.virtual_source_active
+                    dev.microphone.is_eq_default_source = bool(use_eq_source)
+                    dev.microphone.is_raw_default_source = not bool(use_eq_source)
+                    self._update_cached_mic_entry(dev)
+
+        threading.Thread(target=_worker, daemon=True).start()
+        return True
 
     @Slot(str, int, str, result=bool)
     def remapButton(self, device_id: str, button_idx: int, action: str) -> bool:
@@ -635,6 +1081,25 @@ class DeviceManager(QObject):
 
         self.profile_mgr.set_active_profile(dev_key, profile_name)
 
+        if dev.microphone is not None:
+            mic_cfg = prof_data.get("microphone")
+            if isinstance(mic_cfg, dict):
+                apply_config_to_mic_info(dev.microphone, mic_cfg)
+            self._update_cached_mic_entry(dev)
+            mic_snapshot = replace(dev.microphone, bands=[replace(b) for b in dev.microphone.bands])
+            apply_volume = isinstance(mic_cfg, dict) and "volume" in mic_cfg
+
+            def _mic_worker():
+                with self._mic_io_lock:
+                    for b in self._get_mic_backends():
+                        b.apply_eq(device_id, mic_snapshot)
+                        if apply_volume:
+                            b.set_volume(device_id, mic_snapshot.volume)
+                        break
+
+            threading.Thread(target=_mic_worker, daemon=True).start()
+            return True
+
         # Update local cache immediately
         buttons_data = prof_data.get("buttons", {})
         if dev.buttons:
@@ -674,19 +1139,26 @@ class DeviceManager(QObject):
     @Slot(str, str, result=bool)
     def saveProfile(self, device_id: str, profile_name: str) -> bool:
         dev = self._get_device_by_id(device_id)
-        if not dev or not profile_name.strip():
+        clean_name = profile_name.strip() if profile_name else ""
+        if not dev or not clean_name:
             return False
         dev_key = get_device_key(dev)
+
+        if dev.microphone is not None:
+            self.profile_mgr.save_mic_profile(dev_key, clean_name, mic_info_to_config(dev.microphone))
+            self._update_cached_mic_entry(dev)
+            return True
+
         buttons = {b.index: b.action_value for b in dev.buttons}
         dpi = dev.dpi.current if (dev.dpi and not dev.dpi.is_disabled) else None
-        self.profile_mgr.save_profile(dev_key, profile_name.strip(), buttons, dpi)
+        self.profile_mgr.save_profile(dev_key, clean_name, buttons, dpi)
 
         # Update local cache immediately
         for d in self._cached_dict_devices:
             if d["id"] == device_id:
-                if profile_name.strip() not in d.get("profiles", []):
-                    d["profiles"].append(profile_name.strip())
-                d["activeProfile"] = profile_name.strip()
+                if clean_name not in d.get("profiles", []):
+                    d["profiles"].append(clean_name)
+                d["activeProfile"] = clean_name
                 self.devicesChanged.emit()
                 break
 
@@ -720,6 +1192,26 @@ class DeviceManager(QObject):
         if not dev:
             return False
         dev_key = get_device_key(dev)
+
+        if dev.microphone is not None:
+            dev.microphone.volume = 100
+            dev.microphone.eq_enabled = True
+            dev.microphone.highpass_enabled = False
+            dev.microphone.highpass_freq = 80
+            dev.microphone.bands = create_default_eq_bands()
+            self.profile_mgr.reset_mic_to_default(dev_key, mic_info_to_config(dev.microphone))
+            self._update_cached_mic_entry(dev)
+            mic_snapshot = replace(dev.microphone, bands=[replace(b) for b in dev.microphone.bands])
+
+            def _mic_reset_worker():
+                with self._mic_io_lock:
+                    for b in self._get_mic_backends():
+                        b.apply_eq(device_id, mic_snapshot)
+                        b.set_volume(device_id, 100)
+                        break
+
+            threading.Thread(target=_mic_reset_worker, daemon=True).start()
+            return True
 
         defaults = get_factory_reset_defaults(
             dev.name,

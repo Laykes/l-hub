@@ -7,6 +7,7 @@ import os
 import shutil
 import sys
 import tempfile
+import threading
 from pathlib import Path
 from typing import Any, Dict, Optional
 
@@ -19,6 +20,15 @@ LOW_BATTERY_THRESHOLD_MIN = 5
 LOW_BATTERY_THRESHOLD_MAX = 50
 POLL_INTERVAL_MIN = 10
 POLL_INTERVAL_MAX = 120
+HEADSET_SIDETONE_MIN = 0
+HEADSET_SIDETONE_MAX = 128
+HEADSET_INACTIVE_TIME_MIN = 0
+HEADSET_INACTIVE_TIME_MAX = 90
+
+_HEADSET_SETTING_BOUNDS: Dict[str, tuple[int, int]] = {
+    "sidetone": (HEADSET_SIDETONE_MIN, HEADSET_SIDETONE_MAX),
+    "inactive_time": (HEADSET_INACTIVE_TIME_MIN, HEADSET_INACTIVE_TIME_MAX),
+}
 
 DEFAULT_SETTINGS: Dict[str, Any] = {
     "autostart": False,
@@ -57,10 +67,10 @@ def _coerce_bool(value: Any, default: bool) -> bool:
     return default
 
 
-def _coerce_int_clamped(value: Any, default: int, minimum: int, maximum: int) -> int:
-    """Coerce a numeric value into an int clamped to [minimum, maximum]."""
+def _coerce_int_clamped_optional(value: Any, minimum: int, maximum: int) -> Optional[int]:
+    """Coerce a numeric value into an int clamped to [minimum, maximum], or None if invalid."""
     if isinstance(value, bool):
-        return default
+        return None
     parsed: Optional[int] = None
     if isinstance(value, int):
         parsed = value
@@ -80,8 +90,36 @@ def _coerce_int_clamped(value: Any, default: int, minimum: int, maximum: int) ->
                 if math.isfinite(num):
                     parsed = int(round(num))
     if parsed is None:
-        return default
+        return None
     return max(minimum, min(maximum, parsed))
+
+
+def _coerce_int_clamped(value: Any, default: int, minimum: int, maximum: int) -> int:
+    """Coerce a numeric value into an int clamped to [minimum, maximum]."""
+    parsed = _coerce_int_clamped_optional(value, minimum, maximum)
+    return default if parsed is None else parsed
+
+
+def _validate_headset_settings(raw: Any) -> Dict[str, Dict[str, int]]:
+    """Validate persisted per-headset settings keyed by device_key."""
+    if not isinstance(raw, dict):
+        return {}
+    validated: Dict[str, Dict[str, int]] = {}
+    for raw_key, entry in raw.items():
+        if not isinstance(raw_key, str) or not isinstance(entry, dict):
+            continue
+        dev_key = raw_key.strip()
+        if not dev_key:
+            continue
+        clean_entry: Dict[str, int] = {}
+        for setting_key, (minimum, maximum) in _HEADSET_SETTING_BOUNDS.items():
+            if setting_key in entry:
+                coerced = _coerce_int_clamped_optional(entry[setting_key], minimum, maximum)
+                if coerced is not None:
+                    clean_entry[setting_key] = coerced
+        if clean_entry:
+            validated[dev_key] = clean_entry
+    return validated
 
 
 def _validate_settings(raw: Dict[str, Any], base: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
@@ -226,7 +264,9 @@ class SettingsManager:
         ) / AUTOSTART_FILENAME
         self._local_bin = Path(local_bin) if local_bin is not None else None
 
+        self._lock = threading.RLock()
         self._data: Dict[str, Any] = DEFAULT_SETTINGS.copy()
+        self._headset_settings: Dict[str, Dict[str, int]] = {}
         self._load()
 
     @property
@@ -239,61 +279,122 @@ class SettingsManager:
 
     @property
     def autostart(self) -> bool:
-        return bool(self._data["autostart"])
+        with self._lock:
+            return bool(self._data["autostart"])
 
     @property
     def start_minimized(self) -> bool:
-        return bool(self._data["start_minimized"])
+        with self._lock:
+            return bool(self._data["start_minimized"])
 
     @property
     def low_battery_threshold(self) -> int:
-        return int(self._data["low_battery_threshold"])
+        with self._lock:
+            return int(self._data["low_battery_threshold"])
 
     @property
     def notify_low_battery(self) -> bool:
-        return bool(self._data["notify_low_battery"])
+        with self._lock:
+            return bool(self._data["notify_low_battery"])
 
     @property
     def notify_profile_change(self) -> bool:
-        return bool(self._data["notify_profile_change"])
+        with self._lock:
+            return bool(self._data["notify_profile_change"])
 
     @property
     def poll_interval_sec(self) -> int:
-        return int(self._data["poll_interval_sec"])
+        with self._lock:
+            return int(self._data["poll_interval_sec"])
 
     def as_dict(self) -> Dict[str, Any]:
-        return self._data.copy()
+        with self._lock:
+            return self._data.copy()
+
+    def get_headset_settings(self, device_key: str) -> Dict[str, int]:
+        """Return persisted sidetone/inactive_time settings for a headset device_key."""
+        if not isinstance(device_key, str):
+            return {}
+        key = device_key.strip()
+        if not key:
+            return {}
+        with self._lock:
+            entry = self._headset_settings.get(key)
+            return dict(entry) if entry else {}
+
+    def set_headset_setting(self, device_key: str, key: str, value: Any) -> bool:
+        """Persist a single headset setting ('sidetone' or 'inactive_time') for device_key."""
+        if not isinstance(device_key, str):
+            return False
+        dev_key = device_key.strip()
+        bounds = _HEADSET_SETTING_BOUNDS.get(key)
+        if not dev_key or bounds is None:
+            return False
+        coerced = _coerce_int_clamped_optional(value, bounds[0], bounds[1])
+        if coerced is None:
+            return False
+        with self._lock:
+            entry = self._headset_settings.setdefault(dev_key, {})
+            entry[key] = coerced
+            return self._save()
+
+    def clear_headset_settings(self, device_key: Optional[str] = None) -> bool:
+        """Remove persisted headset settings for one device_key (or all headsets if None)."""
+        with self._lock:
+            if device_key is None:
+                if not self._headset_settings:
+                    return True
+                self._headset_settings.clear()
+                return self._save()
+            key = device_key.strip() if isinstance(device_key, str) else ""
+            if not key or key not in self._headset_settings:
+                return True
+            del self._headset_settings[key]
+            return self._save()
 
     def _load(self) -> None:
-        if not self._file.exists():
-            return
-        try:
-            with open(self._file, "r", encoding="utf-8") as handle:
-                content = json.load(handle)
-            if not isinstance(content, dict):
-                logger.warning("Failed to load settings from %s: expected a JSON object", self._file)
-                self._data = DEFAULT_SETTINGS.copy()
+        with self._lock:
+            if not self._file.exists():
                 return
-            self._data = _validate_settings(content, base=DEFAULT_SETTINGS)
-        except Exception as exc:
-            logger.warning("Failed to load settings from %s: %s", self._file, exc)
-            self._data = DEFAULT_SETTINGS.copy()
+            try:
+                with open(self._file, "r", encoding="utf-8") as handle:
+                    content = json.load(handle)
+                if not isinstance(content, dict):
+                    logger.warning("Failed to load settings from %s: expected a JSON object", self._file)
+                    self._data = DEFAULT_SETTINGS.copy()
+                    self._headset_settings = {}
+                    return
+                self._data = _validate_settings(content, base=DEFAULT_SETTINGS)
+                self._headset_settings = _validate_headset_settings(content.get("headset_settings"))
+            except Exception as exc:
+                logger.warning("Failed to load settings from %s: %s", self._file, exc)
+                self._data = DEFAULT_SETTINGS.copy()
+                self._headset_settings = {}
 
     def _save(self) -> bool:
-        try:
-            payload = json.dumps(self._data, indent=2, ensure_ascii=False) + "\n"
-            _atomic_write_text(self._file, payload)
-            return True
-        except Exception as exc:
-            logger.error("Failed to save settings to %s: %s", self._file, exc)
-            return False
+        with self._lock:
+            try:
+                payload_obj: Dict[str, Any] = dict(self._data)
+                if self._headset_settings:
+                    payload_obj["headset_settings"] = {
+                        k: dict(v) for k, v in self._headset_settings.items()
+                    }
+                payload = json.dumps(payload_obj, indent=2, ensure_ascii=False) + "\n"
+                _atomic_write_text(self._file, payload)
+                return True
+            except Exception as exc:
+                logger.error("Failed to save settings to %s: %s", self._file, exc)
+                return False
 
     def sync_autostart(self) -> bool:
         """Create, update, or remove the XDG autostart .desktop entry."""
         try:
-            if self.autostart:
+            with self._lock:
+                autostart = self.autostart
+                start_minimized = self.start_minimized
+            if autostart:
                 content = build_autostart_desktop_entry(
-                    start_minimized=self.start_minimized,
+                    start_minimized=start_minimized,
                     local_bin=self._local_bin,
                 )
                 _atomic_write_text(self._autostart_file, content)
@@ -309,8 +410,9 @@ class SettingsManager:
         """Validate and persist a partial or full settings update."""
         if not isinstance(changes, dict):
             return False
-        self._data = _validate_settings(changes, base=self._data)
-        saved = self._save()
+        with self._lock:
+            self._data = _validate_settings(changes, base=self._data)
+            saved = self._save()
         synced = True
         if "autostart" in changes or "start_minimized" in changes:
             synced = self.sync_autostart()

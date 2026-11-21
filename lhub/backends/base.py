@@ -7,6 +7,7 @@ class DeviceType(Enum):
     MOUSE = "mouse"
     KEYBOARD = "keyboard"
     HEADSET = "headset"
+    MICROPHONE = "microphone"
     OTHER = "other"
 
 
@@ -17,6 +18,9 @@ class Capability(Enum):
     PROFILES = "profiles"
     SIDETONE = "sidetone"
     EQUALIZER = "equalizer"
+    AUDIO_GAIN = "audio_gain"
+    AUDIO_MUTE = "audio_mute"
+    MIC_MONITOR = "mic_monitor"
     LIGHTING = "lighting"
     POLLING_RATE = "polling_rate"
     INACTIVE_TIME = "inactive_time"
@@ -57,6 +61,37 @@ class ButtonMapping:
 
 
 @dataclass
+class EqBand:
+    id: str
+    label: str
+    freq: float
+    freq_label: str
+    filter_type: str = "bq_peaking"
+    q: float = 1.0
+    gain: float = 0.0  # -12.0 to +12.0 dB
+
+
+@dataclass
+class MicrophoneInfo:
+    source_name: str
+    source_node_id: Optional[int] = None
+    channels: int = 2
+    channel_position: str = "[ FL FR ]"
+    volume: int = 100  # 0-150%
+    muted: bool = False
+    eq_enabled: bool = True
+    highpass_enabled: bool = False
+    highpass_freq: int = 80  # 40-250 Hz
+    bands: List[EqBand] = field(default_factory=list)
+    virtual_source_name: str = ""
+    virtual_source_description: str = ""
+    virtual_source_active: bool = False
+    is_eq_default_source: bool = False
+    is_raw_default_source: bool = False
+    monitoring: bool = False
+
+
+@dataclass
 class Device:
     id: str
     name: str
@@ -68,6 +103,7 @@ class Device:
     battery: Optional[BatteryInfo] = None
     dpi: Optional[DpiInfo] = None
     buttons: List[ButtonMapping] = field(default_factory=list)
+    microphone: Optional[MicrophoneInfo] = None
     sidetone: Optional[int] = None  # 0-128
     inactive_time: Optional[int] = None  # minutes
     onboard_profile_id: Optional[int] = None
@@ -119,5 +155,9 @@ class BaseBackend:
 
     def stop_monitoring(self) -> None:
         """Stop event monitoring and clean up any active subscriptions."""
+        return None
+
+    def cleanup(self) -> None:
+        """Release any managed child processes or audio resources on app exit."""
         return None
 

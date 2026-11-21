@@ -120,7 +120,7 @@ RowLayout {
     UiButton {
         text: "Save"
         iconName: "document-save-symbolic"
-        toolTipText: "Save current button mapping to profile '" + (root.deviceData.activeProfile || "Default") + "'"
+        toolTipText: "Save current settings to profile '" + (root.deviceData.activeProfile || "Default") + "'"
         onClicked: root.saveProfileRequested(root.deviceData.activeProfile || "Default")
     }
 
@@ -134,7 +134,7 @@ RowLayout {
     UiButton {
         text: "Reset"
         iconName: "edit-undo-symbolic"
-        toolTipText: "Restore factory default button mapping and settings"
+        toolTipText: "Restore default settings"
         onClicked: root.resetDefaultRequested()
     }
 

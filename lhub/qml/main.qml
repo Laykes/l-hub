@@ -267,6 +267,7 @@ QQC2.ApplicationWindow {
                                             source: {
                                                 if (modelData.type === "mouse") return "input-mouse"
                                                 if (modelData.type === "headset") return "audio-headset"
+                                                if (modelData.type === "microphone") return "audio-input-microphone"
                                                 if (modelData.type === "keyboard") return "input-keyboard"
                                                 return "input-gaming"
                                             }
@@ -317,12 +318,23 @@ QQC2.ApplicationWindow {
                                             Text {
                                                 visible: !(Boolean(modelData.hasBattery) && (modelData.batteryPercentage >= 0 || modelData.isCharging))
                                                 text: {
+                                                    if (modelData.hasMicrophone) {
+                                                        if (modelData.micMuted) return "Muted"
+                                                        if (modelData.micMonitoring) return "Live Test · " + (modelData.micVolume !== undefined ? modelData.micVolume : 100) + "%"
+                                                        return (modelData.micEqEnabled ? "EQ On · " : "EQ Off · ") + (modelData.micVolume !== undefined ? modelData.micVolume : 100) + "%"
+                                                    }
                                                     if (modelData.hasDpi && modelData.currentDpi) {
                                                         return modelData.currentDpi + " DPI"
                                                     }
                                                     return modelData.vendor || modelData.backend || "Connected"
                                                 }
-                                                color: theme.textMuted
+                                                color: {
+                                                    if (modelData.hasMicrophone) {
+                                                        if (modelData.micMuted) return theme.danger
+                                                        if (modelData.micMonitoring) return theme.positive
+                                                    }
+                                                    return theme.textMuted
+                                                }
                                                 font.pixelSize: 11
                                                 elide: Text.ElideRight
                                             }
@@ -699,6 +711,64 @@ QQC2.ApplicationWindow {
                             }
                         }
 
+                        onInactiveTimeChanged: function(minutes) {
+                            if (root.selectedDevice) {
+                                deviceManager.setInactiveTime(root.selectedDevice.id, minutes)
+                            }
+                        }
+
+                        onMicVolumeChanged: function(volume) {
+                            if (root.selectedDevice) {
+                                deviceManager.setMicVolume(root.selectedDevice.id, volume)
+                            }
+                        }
+
+                        onMicMutedToggled: function(muted) {
+                            if (root.selectedDevice) {
+                                deviceManager.setMicMuted(root.selectedDevice.id, muted)
+                            }
+                        }
+
+                        onMicEqEnabledToggled: function(enabled) {
+                            if (root.selectedDevice) {
+                                deviceManager.setMicEqEnabled(root.selectedDevice.id, enabled)
+                                root.showToast(enabled ? "Microphone EQ enabled." : "Microphone EQ bypassed.")
+                            }
+                        }
+
+                        onMicHighpassChanged: function(enabled, freq) {
+                            if (root.selectedDevice) {
+                                deviceManager.setMicHighpass(root.selectedDevice.id, enabled, freq)
+                            }
+                        }
+
+                        onMicEqBandChanged: function(bandId, gain) {
+                            if (root.selectedDevice) {
+                                deviceManager.setMicEqBand(root.selectedDevice.id, bandId, gain)
+                            }
+                        }
+
+                        onMicPresetSelected: function(presetName) {
+                            if (root.selectedDevice) {
+                                deviceManager.applyMicPreset(root.selectedDevice.id, presetName)
+                                root.showToast("Loaded EQ preset '" + presetName + "'.")
+                            }
+                        }
+
+                        onMicMonitoringToggled: function(enabled) {
+                            if (root.selectedDevice) {
+                                deviceManager.setMicMonitoring(root.selectedDevice.id, enabled)
+                                root.showToast(enabled ? "Live voice test started." : "Live voice test stopped.")
+                            }
+                        }
+
+                        onMicDefaultSourceRequested: function(useEqSource) {
+                            if (root.selectedDevice) {
+                                deviceManager.setMicAsDefault(root.selectedDevice.id, useEqSource)
+                                root.showToast("Set L-Hub EQ microphone as system default.")
+                            }
+                        }
+
                         onButtonRemapRequested: function(btnIdx, btnName, curAct, curActDisp, defAct, btnLoc) {
                             if (!root.selectedDevice) return
                             remapDialog.targetDeviceId = root.selectedDevice.id
@@ -990,7 +1060,7 @@ QQC2.ApplicationWindow {
             }
 
             Text {
-                text: "Restore factory default button assignments and settings for " + resetConfirmDialog.targetDeviceName + "?"
+                text: "Restore default settings for " + resetConfirmDialog.targetDeviceName + "?"
                 color: theme.textSecondary
                 font.pixelSize: 13
                 wrapMode: Text.WordWrap

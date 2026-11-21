@@ -50,6 +50,7 @@ Rectangle {
                 source: {
                     if (root.deviceData.type === "mouse") return "input-mouse"
                     if (root.deviceData.type === "headset") return "audio-headset"
+                    if (root.deviceData.type === "microphone") return "audio-input-microphone"
                     if (root.deviceData.type === "keyboard") return "input-keyboard"
                     return "input-gaming"
                 }
@@ -146,6 +147,63 @@ Rectangle {
                 anchors.fill: parent
                 hoverEnabled: true
                 acceptedButtons: Qt.NoButton
+            }
+        }
+
+        // Microphone Live Status Pill
+        Rectangle {
+            visible: Boolean(root.deviceData.hasMicrophone)
+            Layout.alignment: Qt.AlignRight | Qt.AlignVCenter
+            color: {
+                if (root.deviceData.micMuted) return theme.dangerSoft
+                if (root.deviceData.micMonitoring) return theme.positiveSoft
+                if (root.deviceData.micEqEnabled) return theme.accentSoft
+                return theme.bgControl
+            }
+            border.color: {
+                if (root.deviceData.micMuted) return theme.dangerBorder
+                if (root.deviceData.micMonitoring) return theme.positive
+                if (root.deviceData.micEqEnabled) return theme.accentBorder
+                return theme.borderSubtle
+            }
+            border.width: 1
+            radius: theme.radiusPill
+            implicitWidth: micStatusRow.implicitWidth + 20
+            implicitHeight: 32
+
+            RowLayout {
+                id: micStatusRow
+                anchors.centerIn: parent
+                spacing: 6
+
+                Rectangle {
+                    width: 7
+                    height: 7
+                    radius: 4
+                    color: {
+                        if (root.deviceData.micMuted) return theme.danger
+                        if (root.deviceData.micMonitoring) return theme.positive
+                        if (root.deviceData.micEqEnabled) return theme.accent
+                        return theme.textMuted
+                    }
+                }
+
+                Text {
+                    text: {
+                        if (root.deviceData.micMuted) return "Muted"
+                        if (root.deviceData.micMonitoring) return "Live Test"
+                        if (root.deviceData.micEqEnabled) return "EQ Active"
+                        return "EQ Bypassed"
+                    }
+                    color: {
+                        if (root.deviceData.micMuted) return theme.danger
+                        if (root.deviceData.micMonitoring) return theme.positive
+                        if (root.deviceData.micEqEnabled) return theme.accent
+                        return theme.textSecondary
+                    }
+                    font.pixelSize: 12
+                    font.weight: Font.DemiBold
+                }
             }
         }
 

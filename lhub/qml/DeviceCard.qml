@@ -11,6 +11,15 @@ ColumnLayout {
 
     signal dpiSelected(int dpi)
     signal sidetoneChanged(int level)
+    signal inactiveTimeChanged(int minutes)
+    signal micVolumeChanged(int volume)
+    signal micMutedToggled(bool muted)
+    signal micEqEnabledToggled(bool enabled)
+    signal micHighpassChanged(bool enabled, int freq)
+    signal micEqBandChanged(string bandId, real gain)
+    signal micPresetSelected(string presetName)
+    signal micMonitoringToggled(bool enabled)
+    signal micDefaultSourceRequested(bool useEqSource)
     signal buttonRemapRequested(int buttonIdx, string buttonName, string currentAction, string currentActionDisplay, string defaultAction, string buttonLocation)
     signal profileSelected(string profileName)
     signal saveProfileRequested(string profileName)
@@ -72,13 +81,57 @@ ColumnLayout {
         }
     }
 
-    // 3. Sidetone Panel (Headset)
+    // 3. Headset Controls Panel (Sidetone & Auto Shut-Off)
     HeadsetSection {
         Layout.fillWidth: true
         deviceData: root.deviceData
         onSidetoneChanged: function(level) {
             root.sidetoneChanged(level)
         }
+        onInactiveTimeChanged: function(minutes) {
+            root.inactiveTimeChanged(minutes)
+        }
+    }
+
+    // 3b. USB Microphone Controls, Equalizer & Live Voice Test
+    MicrophoneSection {
+        Layout.fillWidth: true
+        deviceData: root.deviceData
+        onVolumeChanged: function(volume) {
+            root.micVolumeChanged(volume)
+        }
+        onMutedToggled: function(muted) {
+            root.micMutedToggled(muted)
+        }
+        onEqEnabledToggled: function(enabled) {
+            root.micEqEnabledToggled(enabled)
+        }
+        onHighpassChanged: function(enabled, freq) {
+            root.micHighpassChanged(enabled, freq)
+        }
+        onEqBandChanged: function(bandId, gain) {
+            root.micEqBandChanged(bandId, gain)
+        }
+        onPresetSelected: function(presetName) {
+            root.micPresetSelected(presetName)
+        }
+        onMonitoringToggled: function(enabled) {
+            root.micMonitoringToggled(enabled)
+        }
+        onDefaultSourceRequested: function(useEqSource) {
+            root.micDefaultSourceRequested(useEqSource)
+        }
+        onProfileSelected: function(profileName) {
+            root.profileSelected(profileName)
+        }
+        onSaveProfileRequested: function(profileName) {
+            root.saveProfileRequested(profileName)
+        }
+        onNewProfileRequested: root.newProfileRequested()
+        onDeleteProfileRequested: function(profileName) {
+            root.deleteProfileRequested(profileName)
+        }
+        onResetDefaultRequested: root.resetDefaultRequested()
     }
 
     // 4. Profiles & Button Mapping Panel
