@@ -1,4 +1,5 @@
 import sys
+import tempfile
 import time
 import unittest
 from pathlib import Path
@@ -34,6 +35,7 @@ from lhub.backends.ratbag import (
     RatbagBackend,
 )
 from lhub.manager import DeviceManager
+from lhub.settings import SettingsManager
 
 _app = QGuiApplication.instance() or QGuiApplication(sys.argv)
 
@@ -617,6 +619,34 @@ class TestDeviceManagerHotplugAndDebounce(unittest.TestCase):
         self.assertEqual(mgr.missingBackends, ["ratbagd offline"])
         # Reading property again must not re-probe backend
         self.assertEqual(hp.is_available.call_count, 1)
+
+    def test_settings_poll_interval_updates_cli_fallback_timer_without_breaking_hotplug(self):
+        hp = _DummyHotplugBackend("ratbagd")
+        cli = _DummyPollingBackend("headsetcontrol")
+        with tempfile.TemporaryDirectory() as td:
+            settings = SettingsManager(
+                config_file=Path(td) / "settings.json",
+                autostart_dir=Path(td) / "autostart",
+            )
+            mgr = DeviceManager(
+                auto_refresh=False,
+                backends=[hp, cli],
+                enable_hotplug=True,
+                settings_mgr=settings,
+            )
+            self.addCleanup(mgr.cleanup)
+
+            self.assertEqual(mgr._timer.interval(), 30000)
+            self.assertTrue(mgr.updateSettings({"pollIntervalSec": 45}))
+            self.assertEqual(mgr._timer.interval(), 45000)
+
+            # Fallback timer still skips monitored hotplug backend and scans only CLI backend
+            with patch.object(mgr, "_start_scan") as mock_start_scan:
+                mgr._on_poll_timeout()
+                mock_start_scan.assert_called_once_with(backends_to_scan=[cli])
+
+            self.assertTrue(mgr.resetSettings())
+            self.assertEqual(mgr._timer.interval(), 30000)
 
 
 if __name__ == "__main__":

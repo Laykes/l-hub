@@ -19,9 +19,12 @@ Rectangle {
 
     function batteryColor() {
         var pct = deviceData.batteryPercentage
+        var threshold = (typeof deviceManager !== "undefined" && deviceManager && deviceManager.lowBatteryThreshold !== undefined)
+                        ? deviceManager.lowBatteryThreshold
+                        : 20
         if (deviceData.isCharging && pct < 0) return theme.positive
         if (pct > 50) return theme.positive
-        if (pct > 20) return theme.warning
+        if (pct > threshold) return theme.warning
         return theme.danger
     }
 

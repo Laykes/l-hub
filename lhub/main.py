@@ -31,6 +31,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Enable verbose debug logging",
     )
+    parser.add_argument(
+        "--minimized",
+        action="store_true",
+        help="Start minimized to the system tray without showing the main window",
+    )
     return parser
 
 
@@ -55,7 +60,7 @@ def run(argv: Optional[Sequence[str]] = None):
 
     args, qt_args = parse_args(argv)
     configure_logging(debug=args.debug)
-    logger.info("Starting L-Hub (debug=%s)", args.debug)
+    logger.info("Starting L-Hub (debug=%s, minimized=%s)", args.debug, args.minimized)
     logger.debug("Passing Qt arguments: %s", qt_args)
 
     app = QApplication([sys.argv[0], *qt_args])
@@ -79,6 +84,7 @@ def run(argv: Optional[Sequence[str]] = None):
     manager = DeviceManager(auto_refresh=False)
     app.aboutToQuit.connect(manager.cleanup)
     engine.rootContext().setContextProperty("deviceManager", manager)
+    engine.rootContext().setContextProperty("startMinimized", bool(args.minimized))
 
     qml_path = Path(__file__).resolve().parent / "qml" / "main.qml"
     engine.load(QUrl.fromLocalFile(str(qml_path)))

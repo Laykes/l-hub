@@ -117,6 +117,9 @@ class LHubTray(QObject):
                 logger.warning("Failed to send desktop notification via notify-send: %s", exc)
 
     def _on_battery_warning(self, name: str, percentage: int):
+        manager = getattr(self, "manager", None)
+        if manager is not None and not getattr(manager, "notifyLowBattery", True):
+            return
         self._notify(
             "Low Battery",
             f"{name} battery is down to {percentage}%!",
@@ -125,6 +128,9 @@ class LHubTray(QObject):
         )
 
     def _on_onboard_profile_changed(self, device_name: str, profile_label: str):
+        manager = getattr(self, "manager", None)
+        if manager is not None and not getattr(manager, "notifyProfileChange", True):
+            return
         self._notify(
             device_name,
             f"Onboard Profile: {profile_label}",

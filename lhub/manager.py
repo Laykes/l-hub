@@ -23,8 +23,23 @@ from .health import SEVERITY_ERROR, log_health_checks, run_health_checks
 from .keymap import resolve_key_action
 from .profiles import ProfileManager
 from .serializers import device_to_dict, get_device_key
+from .settings import SettingsManager
 
 logger = logging.getLogger(__name__)
+
+_SETTINGS_KEY_MAP: Dict[str, str] = {
+    "autostart": "autostart",
+    "startMinimized": "start_minimized",
+    "start_minimized": "start_minimized",
+    "lowBatteryThreshold": "low_battery_threshold",
+    "low_battery_threshold": "low_battery_threshold",
+    "notifyLowBattery": "notify_low_battery",
+    "notify_low_battery": "notify_low_battery",
+    "notifyProfileChange": "notify_profile_change",
+    "notify_profile_change": "notify_profile_change",
+    "pollIntervalSec": "poll_interval_sec",
+    "poll_interval_sec": "poll_interval_sec",
+}
 
 
 def _apply_button_dict_action(btn_dict: Dict[str, Any], norm_action: str, norm_display: str) -> None:
@@ -37,14 +52,13 @@ def _apply_button_dict_action(btn_dict: Dict[str, Any], norm_action: str, norm_d
 class DeviceManager(QObject):
     """Main QML-exposed coordinator for peripheral discovery, settings, and diagnostics."""
 
-    LOW_BATTERY_THRESHOLD = 20
-    LOW_BATTERY_RESET_THRESHOLD = 25
+    LOW_BATTERY_HYSTERESIS = 5
     HOTPLUG_DEBOUNCE_MS = 400
-    FALLBACK_POLL_INTERVAL_MS = 30000
 
     devicesChanged = Signal()
     statusChanged = Signal()
     healthChecksChanged = Signal()
+    settingsChanged = Signal()
     batteryWarning = Signal(str, int)  # device_name, percentage
     onboardProfileChanged = Signal(str, str)  # device_name, profile_label
     testStateChanged = Signal()
@@ -60,9 +74,11 @@ class DeviceManager(QObject):
         auto_refresh: bool = True,
         backends: Optional[List[BaseBackend]] = None,
         enable_hotplug: bool = True,
+        settings_mgr: Optional[SettingsManager] = None,
     ):
         super().__init__(parent)
         self.profile_mgr = ProfileManager()
+        self.settings_mgr = settings_mgr if settings_mgr is not None else SettingsManager()
         self.backends: List[BaseBackend] = (
             list(backends)
             if backends is not None
@@ -103,9 +119,10 @@ class DeviceManager(QObject):
         if enable_hotplug:
             self._start_backend_monitors()
 
-        # Lightweight fallback polling timer for non-hotplug CLI backends (e.g. headsetcontrol)
+        # Lightweight fallback polling timer for non-hotplug CLI backends (e.g. headsetcontrol),
+        # driven live by SettingsManager.poll_interval_sec
         self._timer = QTimer(self)
-        self._timer.setInterval(self.FALLBACK_POLL_INTERVAL_MS)
+        self._timer.setInterval(self.settings_mgr.poll_interval_sec * 1000)
         self._timer.timeout.connect(self._on_poll_timeout)
         self._timer.start()
 
@@ -250,17 +267,20 @@ class DeviceManager(QObject):
             self._scanFinished.emit()
 
     def _check_battery_warnings(self, devices: List[Device]):
+        threshold = self.settings_mgr.low_battery_threshold
+        reset_threshold = threshold + self.LOW_BATTERY_HYSTERESIS
+        notify_enabled = self.settings_mgr.notify_low_battery
         for d in devices:
             if not d.battery or not d.battery.is_supported:
                 continue
             dev_key = get_device_key(d)
             if d.battery.is_charging:
                 self._warned_devices.discard(dev_key)
-            elif 0 <= d.battery.percentage <= self.LOW_BATTERY_THRESHOLD:
-                if dev_key not in self._warned_devices:
+            elif 0 <= d.battery.percentage <= threshold:
+                if dev_key not in self._warned_devices and notify_enabled:
                     self._warned_devices.add(dev_key)
                     self.batteryWarning.emit(d.name, d.battery.percentage)
-            elif d.battery.percentage > self.LOW_BATTERY_RESET_THRESHOLD:
+            elif d.battery.percentage > reset_threshold:
                 self._warned_devices.discard(dev_key)
 
     def _sync_hidpp_monitors(self, devices: List[Device]):
@@ -314,7 +334,8 @@ class DeviceManager(QObject):
 
         if changed:
             self.devicesChanged.emit()
-            self.onboardProfileChanged.emit(target_dev.name, label)
+            if self.settings_mgr.notify_profile_change:
+                self.onboardProfileChanged.emit(target_dev.name, label)
             if target_dev.usb_vid and target_dev.usb_pid:
                 vid, pid = target_dev.usb_vid, target_dev.usb_pid
 
@@ -400,6 +421,62 @@ class DeviceManager(QObject):
     @Property("QVariantList", notify=statusChanged)
     def missingBackends(self) -> List[str]:
         return list(self._missing_backends)
+
+    @Property(bool, notify=settingsChanged)
+    def autostart(self) -> bool:
+        return self.settings_mgr.autostart
+
+    @Property(bool, notify=settingsChanged)
+    def startMinimized(self) -> bool:
+        return self.settings_mgr.start_minimized
+
+    @Property(int, notify=settingsChanged)
+    def lowBatteryThreshold(self) -> int:
+        return self.settings_mgr.low_battery_threshold
+
+    @Property(bool, notify=settingsChanged)
+    def notifyLowBattery(self) -> bool:
+        return self.settings_mgr.notify_low_battery
+
+    @Property(bool, notify=settingsChanged)
+    def notifyProfileChange(self) -> bool:
+        return self.settings_mgr.notify_profile_change
+
+    @Property(int, notify=settingsChanged)
+    def pollIntervalSec(self) -> int:
+        return self.settings_mgr.poll_interval_sec
+
+    @Property("QVariantMap", notify=settingsChanged)
+    def appSettings(self) -> Dict[str, Any]:
+        return self.settings_mgr.as_dict()
+
+    def _apply_live_settings(self) -> None:
+        new_interval_ms = self.settings_mgr.poll_interval_sec * 1000
+        if self._timer.interval() != new_interval_ms:
+            self._timer.setInterval(new_interval_ms)
+        if self._devices:
+            self._check_battery_warnings(self._devices)
+
+    @Slot("QVariantMap", result=bool)
+    def updateSettings(self, values: Dict[str, Any]) -> bool:
+        if not isinstance(values, dict):
+            return False
+        normalized: Dict[str, Any] = {}
+        for key, val in values.items():
+            mapped = _SETTINGS_KEY_MAP.get(key)
+            if mapped is not None:
+                normalized[mapped] = val
+        ok = self.settings_mgr.update(normalized)
+        self._apply_live_settings()
+        self.settingsChanged.emit()
+        return ok
+
+    @Slot(result=bool)
+    def resetSettings(self) -> bool:
+        ok = self.settings_mgr.reset_defaults()
+        self._apply_live_settings()
+        self.settingsChanged.emit()
+        return ok
 
     def _update_health_checks(self, devices: Optional[List[Device]] = None) -> List[Dict[str, Any]]:
         items = run_health_checks(devices=devices, log_results=False)

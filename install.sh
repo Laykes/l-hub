@@ -10,6 +10,7 @@ ICON_DIR="${HOME}/.local/share/icons/hicolor/scalable/apps"
 ICON_PATH="${ICON_DIR}/${APP_ID}.svg"
 DESKTOP_DIR="${HOME}/.local/share/applications"
 DESKTOP_PATH="${DESKTOP_DIR}/${APP_ID}.desktop"
+AUTOSTART_PATH="${XDG_CONFIG_HOME:-${HOME}/.config}/autostart/${APP_ID}.desktop"
 
 refresh_caches() {
     if command -v update-desktop-database >/dev/null 2>&1; then
@@ -24,7 +25,7 @@ refresh_caches() {
 }
 
 if [[ "${1:-}" == "--uninstall" ]]; then
-    rm -f "${BIN_PATH}" "${ICON_PATH}" "${DESKTOP_PATH}"
+    rm -f "${BIN_PATH}" "${ICON_PATH}" "${DESKTOP_PATH}" "${AUTOSTART_PATH}"
     refresh_caches
     echo "L-Hub wurde aus ~/.local entfernt."
     exit 0
