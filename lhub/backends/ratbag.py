@@ -328,13 +328,20 @@ class RatbagBackend(BaseBackend):
         self._ctl = shutil.which("ratbagctl")
         self._resolution_maps: Dict[str, Dict[int, int]] = {}
         self._usb_ids: Dict[str, Tuple[str, str]] = {}
+        self._device_names: Dict[str, str] = {}
         self._active_profiles: Dict[str, int] = {}
+
+    def _hidpp_kwargs(self, device_id: str) -> Dict[str, Any]:
+        dev_name = self._device_names.get(device_id)
+        if dev_name:
+            return {"device_name": dev_name, "device_key": device_id}
+        return {}
 
     def _resolve_active_profile(self, device_id: str) -> Tuple[Optional[int], Optional[int]]:
         """Return (0-based ratbag profile index, 16-bit HID++ profile ID)."""
         usb_id = self._usb_ids.get(device_id)
         if usb_id:
-            hw_id = hidpp.get_onboard_profile(*usb_id)
+            hw_id = hidpp.get_onboard_profile(*usb_id, **self._hidpp_kwargs(device_id))
             hw_idx = hidpp.onboard_profile_index(hw_id)
             if hw_idx is not None:
                 self._active_profiles[device_id] = hw_idx
@@ -348,7 +355,7 @@ class RatbagBackend(BaseBackend):
         # ratbagd commits asynchronously over hidraw; wait before sending HID++ traffic
         # so we don't collide with the flash write, then reload the active profile into RAM.
         time.sleep(1.5)
-        hidpp.set_onboard_profile(*usb_id, hidpp_profile_id)
+        hidpp.set_onboard_profile(*usb_id, hidpp_profile_id, **self._hidpp_kwargs(device_id))
 
     def is_available(self) -> bool:
         return self._ctl is not None
@@ -444,11 +451,17 @@ class RatbagBackend(BaseBackend):
                         profiles[current_prof_idx]["lines"].append(line_s)
 
             caps = [Capability.PROFILES]
+            if dev_name:
+                self._device_names[dev_id] = dev_name
             if vid and pid:
                 self._usb_ids[dev_id] = (vid, pid)
 
             # ratbagd does not track hardware onboard profile switches; prefer live HID++ profile.
-            onboard_profile_id = hidpp.get_onboard_profile(vid, pid) if (vid and pid) else None
+            onboard_profile_id = (
+                hidpp.get_onboard_profile(vid, pid, **self._hidpp_kwargs(dev_id))
+                if (vid and pid)
+                else None
+            )
             onboard_profile = (
                 hidpp.format_onboard_profile(onboard_profile_id)
                 if onboard_profile_id is not None
@@ -596,7 +609,7 @@ class RatbagBackend(BaseBackend):
         # ratbagd's value is stale when profile commits fail; the device itself is authoritative.
         usb_id = self._usb_ids.get(dev_id)
         if usb_id:
-            hw_dpi = hidpp.get_dpi(*usb_id)
+            hw_dpi = hidpp.get_dpi(*usb_id, **self._hidpp_kwargs(dev_id))
             if hw_dpi and 50 <= hw_dpi <= 30000:
                 info.current = hw_dpi
 
@@ -657,7 +670,7 @@ class RatbagBackend(BaseBackend):
 
     def set_dpi(self, device_id: str, dpi: int) -> bool:
         usb_id = self._usb_ids.get(device_id)
-        if usb_id and hidpp.set_dpi(*usb_id, dpi):
+        if usb_id and hidpp.set_dpi(*usb_id, dpi, **self._hidpp_kwargs(device_id)):
             return True
         if not self.is_available():
             return False

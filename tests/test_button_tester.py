@@ -1,6 +1,7 @@
+import io
 import sys
 import unittest
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -9,7 +10,12 @@ from PySide6.QtCore import QEvent, Qt, QPoint, QPointF
 from PySide6.QtGui import QMouseEvent, QKeyEvent, QWheelEvent, QGuiApplication
 from lhub.manager import DeviceManager
 from lhub.backends.base import Device, DeviceType, Capability, ButtonMapping
-from lhub.backends.hid_input import parse_report_descriptor, HidReportTracker
+from lhub.backends.hid_input import (
+    HidReportTracker,
+    _matching_hidraw_nodes,
+    inspect_report_descriptor,
+    parse_report_descriptor,
+)
 from lhub.backends.ratbag import actions_match
 
 
@@ -431,6 +437,121 @@ class TestHidInputParser(unittest.TestCase):
             tracker.poll_pending(now=4.4),
             ("key KEY_LEFTMETA", "Key: Super / Win"),
         )
+
+    def test_vendor_collection_ignored_by_descriptor_parser(self):
+        vendor_only_desc = bytes.fromhex(
+            "06 00 ff 09 01 a1 01 85 10 75 08 95 06 15 00 26 ff 00 09 01 81 00 09 01 91 00 c0"
+        )
+        layouts, collections = inspect_report_descriptor(vendor_only_desc)
+        self.assertEqual(layouts, {})
+        self.assertEqual(collections, {(0xFF00, 0x01)})
+        self.assertEqual(parse_report_descriptor(vendor_only_desc), {})
+
+        # Even if button usages appear inside a vendor 0xFF00 collection, ignore them
+        vendor_with_buttons_desc = bytes.fromhex(
+            "06 00 ff 09 01 a1 01 85 10 05 09 19 01 29 04 15 00 25 01 95 04 75 01 81 02 "
+            "75 04 95 01 81 03 c0"
+        )
+        self.assertEqual(parse_report_descriptor(vendor_with_buttons_desc), {})
+
+    def _mock_sysfs_hidraw(self, entries):
+        sys_files = {}
+        sys_nodes = []
+        for name, uevent_txt, desc in entries:
+            node = f"/sys/class/hidraw/{name}"
+            sys_nodes.append(node)
+            sys_files[f"{node}/device/uevent"] = uevent_txt
+            sys_files[f"{node}/device/report_descriptor"] = desc
+
+        real_open = open
+
+        def fake_open(file, mode="r", *args, **kwargs):
+            key = str(file)
+            if key in sys_files:
+                val = sys_files[key]
+                if "b" in mode:
+                    return io.BytesIO(val if isinstance(val, bytes) else val.encode("utf-8"))
+                return io.StringIO(val if isinstance(val, str) else val.decode("utf-8"))
+            if key.startswith("/sys/class/hidraw/"):
+                raise FileNotFoundError(key)
+            return real_open(file, mode, *args, **kwargs)
+
+        return sys_nodes, fake_open
+
+    def test_matching_hidraw_nodes_filters_lightspeed_receiver_interfaces(self):
+        vendor_desc = bytes.fromhex(
+            "06 00 ff 09 01 a1 01 85 10 75 08 95 06 15 00 26 ff 00 09 01 81 00 c0"
+        )
+        entries = [
+            (
+                "hidraw0",
+                "DRIVER=logitech-djreceiver\nHID_ID=0003:0000046D:0000C547\nHID_NAME=Logitech USB Receiver\n",
+                self.G502X_MOUSE_DESC,
+            ),
+            (
+                "hidraw1",
+                "DRIVER=hid-generic\nHID_ID=0003:0000046D:0000C547\nHID_NAME=Logitech USB Receiver\n",
+                vendor_desc,
+            ),
+            (
+                "hidraw2",
+                "DRIVER=hid-generic\nHID_ID=0003:0000046D:0000C547\nHID_NAME=Logitech USB Receiver\n",
+                self.G502X_KB_DESC,
+            ),
+            (
+                "hidraw3",
+                "DRIVER=hid-generic\nHID_ID=0003:0000046D:0000C547\nHID_NAME=Logitech USB Receiver\n",
+                self.G502X_MOUSE_DESC,
+            ),
+        ]
+        sys_nodes, fake_open = self._mock_sysfs_hidraw(entries)
+        with patch("lhub.backends.hid_input.glob.glob", return_value=sys_nodes), \
+             patch("builtins.open", side_effect=fake_open):
+            matched = _matching_hidraw_nodes("046d", "c547")
+        # Excludes hidraw0 (logitech-djreceiver) and hidraw1 (vendor-only HID++); orders mouse node first
+        self.assertEqual([path for path, _ in matched], ["/dev/hidraw3", "/dev/hidraw2"])
+
+    def test_matching_hidraw_nodes_unifying_slot_and_name_filtering(self):
+        vendor_desc = bytes.fromhex(
+            "06 00 ff 09 01 a1 01 85 10 75 08 95 06 15 00 26 ff 00 09 01 81 00 c0"
+        )
+        entries = [
+            (
+                "hidraw0",
+                "DRIVER=logitech-djreceiver\nHID_ID=0003:0000046D:0000C52B\n"
+                "HID_NAME=Logitech USB Receiver\nHID_PHYS=usb-0000:00:14.0-2/input2\n",
+                vendor_desc,
+            ),
+            (
+                "hidraw1",
+                "DRIVER=logitech-hidpp-device\nHID_ID=0003:0000046D:00004082\n"
+                "HID_NAME=Logitech MX Master 3\nHID_PHYS=usb-0000:00:14.0-2/input2:1\n",
+                self.G502X_MOUSE_DESC,
+            ),
+            (
+                "hidraw2",
+                "DRIVER=logitech-hidpp-device\nHID_ID=0003:0000046D:000040B3\n"
+                "HID_NAME=Logitech MX Keys\nHID_PHYS=usb-0000:00:14.0-2/input2:2\n",
+                self.G502X_KB_DESC,
+            ),
+            (
+                "hidraw3",
+                "DRIVER=logitech-hidpp-device\nHID_ID=0003:0000046D:00004093\n"
+                "HID_NAME=Logitech G Pro X\nHID_PHYS=usb-0000:00:14.0-5/input2:1\n",
+                self.G502X_MOUSE_DESC,
+            ),
+        ]
+        sys_nodes, fake_open = self._mock_sysfs_hidraw(entries)
+        with patch("lhub.backends.hid_input.glob.glob", return_value=sys_nodes), \
+             patch("builtins.open", side_effect=fake_open):
+            by_name = _matching_hidraw_nodes("046d", "c52b", device_name="Logitech MX Master 3")
+            self.assertEqual([p for p, _ in by_name], ["/dev/hidraw1"])
+
+            by_slot = _matching_hidraw_nodes("046d", "c52b", device_index=2)
+            self.assertEqual([p for p, _ in by_slot], ["/dev/hidraw2"])
+
+            default_nodes = _matching_hidraw_nodes("046d", "c52b")
+            self.assertEqual([p for p, _ in default_nodes], ["/dev/hidraw1"])
 
 
 if __name__ == "__main__":
