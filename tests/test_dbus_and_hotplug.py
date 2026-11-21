@@ -456,6 +456,82 @@ class TestRatbagHotplugSignals(unittest.TestCase):
             self.assertEqual(backend._button_paths["ratbag_hidraw6"][0][0], b0_path)
             self.assertEqual(backend._resolution_paths["ratbag_hidraw6"][0][0], r0_path)
 
+    def test_commit_scope_suppresses_property_signals_and_hidpp_queries(self):
+        callbacks = []
+
+        def fake_sub(svc, path, iface, sig, cb):
+            callbacks.append((iface, sig, cb))
+            return len(callbacks)
+
+        dev_path = "/org/freedesktop/ratbag1/device/hidraw6"
+        p0_path = "/org/freedesktop/ratbag1/profile/hidraw6/p0"
+        b0_path = "/org/freedesktop/ratbag1/button/hidraw6/p0/b0"
+        r0_path = "/org/freedesktop/ratbag1/resolution/hidraw6/p0/r0"
+        props_map = {
+            (dev_path, RATBAG_DEVICE_IFACE): {
+                "Name": "Logitech G502 X",
+                "Model": "usb:046d:c099:0",
+                "DeviceType": 2,
+                "Profiles": [p0_path],
+            },
+            (p0_path, "org.freedesktop.ratbag1.Profile"): {
+                "Index": 0,
+                "Disabled": False,
+                "IsActive": True,
+                "Resolutions": [r0_path],
+                "Buttons": [b0_path],
+            },
+            (r0_path, "org.freedesktop.ratbag1.Resolution"): {
+                "Index": 0,
+                "Resolution": ("u", 1600),
+                "Resolutions": [800, 1600],
+                "IsDisabled": False,
+                "IsActive": True,
+            },
+            (b0_path, "org.freedesktop.ratbag1.Button"): {
+                "Index": 0,
+                "Mapping": (1, ("u", 1)),
+            },
+        }
+        dbus = MagicMock()
+        dbus.subscribe_signal.side_effect = fake_sub
+        dbus.get_all_properties.side_effect = lambda _s, p, i: dict(props_map[(p, i)])
+
+        backend = RatbagBackend(dbus_client=dbus)
+        changes = []
+        backend.start_monitoring(lambda: changes.append(True))
+        by_sig = {(iface, sig): cb for iface, sig, cb in callbacks}
+
+        with patch("lhub.backends.ratbag.hidpp.get_onboard_profile") as mock_prof, \
+             patch("lhub.backends.ratbag.hidpp.get_dpi") as mock_dpi:
+            with backend._commit_scope("ratbag_hidraw6"):
+                # PropertiesChanged & Resync emitted mid-commit must not trigger a scan
+                by_sig[(DBUS_PROPERTIES_IFACE, "PropertiesChanged")](
+                    DBusSignalEvent(RATBAG_SERVICE, b0_path, DBUS_PROPERTIES_IFACE, "PropertiesChanged", ())
+                )
+                by_sig[(RATBAG_DEVICE_IFACE, "Resync")](
+                    DBusSignalEvent(RATBAG_SERVICE, dev_path, RATBAG_DEVICE_IFACE, "Resync", ())
+                )
+                self.assertEqual(len(changes), 0)
+
+                # DeviceNew still passes through
+                by_sig[(RATBAG_MANAGER_IFACE, "DeviceNew")](
+                    DBusSignalEvent(RATBAG_SERVICE, RATBAG_MANAGER_PATH, RATBAG_MANAGER_IFACE, "DeviceNew", (dev_path,))
+                )
+                self.assertEqual(len(changes), 1)
+
+                # Even a concurrent _inspect_device skips raw HID++ queries while committing
+                dev = backend._inspect_device("ratbag_hidraw6", dev_path)
+                self.assertIsNotNone(dev)
+                mock_prof.assert_not_called()
+                mock_dpi.assert_not_called()
+
+            # Once commit scope exits, PropertiesChanged resumes normal delivery
+            by_sig[(DBUS_PROPERTIES_IFACE, "PropertiesChanged")](
+                DBusSignalEvent(RATBAG_SERVICE, b0_path, DBUS_PROPERTIES_IFACE, "PropertiesChanged", ())
+            )
+            self.assertEqual(len(changes), 2)
+
 
 class _DummyHotplugBackend(BaseBackend):
     def __init__(self, name="dummy_dbus", devices=None):

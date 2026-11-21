@@ -2,7 +2,7 @@ import sys
 import unittest
 import tempfile
 from pathlib import Path
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
@@ -227,6 +227,100 @@ class TestMouseProfiles(unittest.TestCase):
             (int(RatbagActionType.KEY), ("u", 63)),
         )
         dbus.call_method.assert_called_once_with(RATBAG_SERVICE, dev_path, RATBAG_DEVICE_IFACE, "Commit")
+
+    def test_encode_key_prefers_macro_for_non_modifiers_when_enabled(self):
+        # Non-modifier keys become a press+release macro so libratbag hidpp20 zeroes modifier_flags
+        enc_f5 = encode_dbus_button_mapping("key KEY_F5", prefer_macro_for_keys=True)
+        self.assertEqual(
+            enc_f5,
+            (
+                int(RatbagActionType.MACRO),
+                (
+                    "a(uu)",
+                    [
+                        (int(RatbagMacroEvent.KEY_PRESS), 63),
+                        (int(RatbagMacroEvent.KEY_RELEASE), 63),
+                    ],
+                ),
+            ),
+        )
+        # Standalone modifier keys must remain ActionType.KEY because libratbag's
+        # ratbag_action_keycode_from_macro does not accept modifier-only macros.
+        enc_meta = encode_dbus_button_mapping("key KEY_LEFTMETA", prefer_macro_for_keys=True)
+        self.assertEqual(enc_meta, (int(RatbagActionType.KEY), ("u", 125)))
+
+    @patch("lhub.backends.ratbag.time.sleep")
+    @patch("lhub.backends.ratbag.hidpp.set_onboard_profile", return_value=True)
+    @patch("lhub.backends.ratbag.hidpp.get_onboard_profile", return_value=0x0002)
+    def test_remap_button_logitech_uses_macro_for_f5_and_verifies_commit(
+        self, _mock_get_prof, mock_set_prof, _mock_sleep
+    ):
+        dev_path = "/org/freedesktop/ratbag1/device/hidraw6"
+        prof_path = "/org/freedesktop/ratbag1/profile/hidraw6/p1"
+        btn_path = "/org/freedesktop/ratbag1/button/hidraw6/p1/b7"
+        dbus = MagicMock()
+        dbus.is_bus_available.return_value = True
+        dbus.has_name_owner.return_value = True
+        dbus.call_method.return_value = (0,)
+        # First Commit attempt leaves profile dirty (e.g. transient USB timeout), retry clears it
+        dbus.get_property.side_effect = [True, True, True, True, True, True, False]
+
+        backend = RatbagBackend(dbus_client=dbus)
+        backend._usb_ids["ratbag_hidraw6"] = ("046d", "c099")
+        backend._device_paths["ratbag_hidraw6"] = dev_path
+        backend._profile_paths["ratbag_hidraw6"] = {1: prof_path}
+        backend._button_paths["ratbag_hidraw6"] = {1: {7: btn_path}}
+        backend._resolution_paths["ratbag_hidraw6"] = {1: {}}
+        backend._resolution_is_xy["ratbag_hidraw6"] = {1: {}}
+
+        ok = backend.remap_button("ratbag_hidraw6", 7, "key KEY_F5")
+        self.assertTrue(ok)
+        dbus.set_property.assert_called_once_with(
+            RATBAG_SERVICE,
+            btn_path,
+            RATBAG_BUTTON_IFACE,
+            "Mapping",
+            "(uv)",
+            (
+                int(RatbagActionType.MACRO),
+                (
+                    "a(uu)",
+                    [
+                        (int(RatbagMacroEvent.KEY_PRESS), 63),
+                        (int(RatbagMacroEvent.KEY_RELEASE), 63),
+                    ],
+                ),
+            ),
+        )
+        self.assertEqual(dbus.call_method.call_count, 2)
+        mock_set_prof.assert_called_once_with("046d", "c099", 0x0002)
+
+    @patch("lhub.backends.ratbag.time.sleep")
+    @patch("lhub.backends.ratbag.hidpp.set_onboard_profile", return_value=True)
+    @patch("lhub.backends.ratbag.hidpp.get_onboard_profile", return_value=0x0002)
+    def test_remap_button_returns_false_when_profile_stays_dirty(
+        self, _mock_get_prof, mock_set_prof, _mock_sleep
+    ):
+        dev_path = "/org/freedesktop/ratbag1/device/hidraw6"
+        prof_path = "/org/freedesktop/ratbag1/profile/hidraw6/p1"
+        btn_path = "/org/freedesktop/ratbag1/button/hidraw6/p1/b7"
+        dbus = MagicMock()
+        dbus.is_bus_available.return_value = True
+        dbus.has_name_owner.return_value = True
+        dbus.call_method.return_value = (0,)
+        dbus.get_property.return_value = True
+
+        backend = RatbagBackend(dbus_client=dbus)
+        backend._usb_ids["ratbag_hidraw6"] = ("046d", "c099")
+        backend._device_paths["ratbag_hidraw6"] = dev_path
+        backend._profile_paths["ratbag_hidraw6"] = {1: prof_path}
+        backend._button_paths["ratbag_hidraw6"] = {1: {7: btn_path}}
+        backend._resolution_paths["ratbag_hidraw6"] = {1: {}}
+        backend._resolution_is_xy["ratbag_hidraw6"] = {1: {}}
+
+        ok = backend.remap_button("ratbag_hidraw6", 7, "key KEY_F5")
+        self.assertFalse(ok)
+        mock_set_prof.assert_not_called()
 
 
 if __name__ == "__main__":

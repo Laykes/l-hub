@@ -158,12 +158,13 @@ class TestHidppOnboardProfiles(unittest.TestCase):
         self, mock_get_prof, mock_set_prof, mock_sleep
     ):
         dev_path = "/org/freedesktop/ratbag1/device/mouse"
+        prof_path = "/org/freedesktop/ratbag1/profile/mouse/p0"
         btn_path = "/org/freedesktop/ratbag1/button/mouse/p0/b6"
-        dbus = _make_dbus_mock({})
+        dbus = _make_dbus_mock({(prof_path, RATBAG_PROFILE_IFACE): {"IsDirty": False}})
         backend = RatbagBackend(dbus_client=dbus)
         backend._usb_ids["mouse"] = ("046d", "c099")
         backend._device_paths["mouse"] = dev_path
-        backend._profile_paths["mouse"] = {0: "/org/freedesktop/ratbag1/profile/mouse/p0"}
+        backend._profile_paths["mouse"] = {0: prof_path}
         backend._button_paths["mouse"] = {0: {6: btn_path}}
         backend._resolution_paths["mouse"] = {0: {}}
         backend._resolution_is_xy["mouse"] = {0: {}}
@@ -176,10 +177,10 @@ class TestHidppOnboardProfiles(unittest.TestCase):
             RATBAG_BUTTON_IFACE,
             "Mapping",
             "(uv)",
-            (int(RatbagActionType.KEY), ("u", 164)),
+            (int(RatbagActionType.MACRO), ("a(uu)", [(1, 164), (2, 164)])),
         )
         dbus.call_method.assert_called_once_with(RATBAG_SERVICE, dev_path, RATBAG_DEVICE_IFACE, "Commit")
-        mock_sleep.assert_called_once()
+        self.assertGreaterEqual(mock_sleep.call_count, 1)
         mock_set_prof.assert_called_once_with("046d", "c099", 0x0001)
 
     def test_parse_onboard_profile_change_events(self):
