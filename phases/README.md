@@ -1,5 +1,4 @@
 # Phases to do
-- [Phase 02](phase-02-refactor-manager-and-qml.md) — Architektur-Entzerrung (`DeviceManager` & QML-Komponenten)
 - [Phase 03](phase-03-device-layouts-data-driven.md) — Datengetriebene Geräte-Layouts statt Hardcoding
 - [Phase 04](phase-04-dbus-backends-and-hotplug.md) — Direktes D-Bus für `ratbagd` & `UPower` + Echtes Hotplugging
 - [Phase 05](phase-05-settings-and-autostart.md) — App-Einstellungen & Autostart
@@ -11,3 +10,4 @@
 
 # Phases done
 - [Phase 01](phase-01-logging-and-health-check.md) — Logging & System-Health-Diagnose
+- [Phase 02](phase-02-refactor-manager-and-qml.md) — Architektur-Entzerrung (`DeviceManager` & QML-Komponenten)
