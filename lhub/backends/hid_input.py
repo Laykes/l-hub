@@ -9,6 +9,7 @@ environment intercepts them before Qt receives a window event.
 
 from dataclasses import dataclass, field
 import glob
+import logging
 import os
 import select
 import threading
@@ -16,6 +17,8 @@ import time
 from typing import Callable, Dict, List, Optional, Set, Tuple
 
 from .ratbag import ACTION_DISPLAY_NAMES, KEY_DISPLAY_NAMES, format_key_combo
+
+logger = logging.getLogger(__name__)
 
 
 MODIFIER_HOLD_TIMEOUT = 0.35
@@ -478,7 +481,8 @@ def _matching_hidraw_nodes(vid: str, pid: str) -> List[Tuple[str, Dict[int, Repo
                     continue
             with open(f"{sys_node}/device/report_descriptor", "rb") as f:
                 desc = f.read()
-        except OSError:
+        except OSError as exc:
+            logger.debug("Skipping %s while discovering hidraw nodes: %s", sys_node, exc)
             continue
         layouts = parse_report_descriptor(desc)
         if layouts:
@@ -514,7 +518,15 @@ class HidInputMonitor:
             try:
                 fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
                 opened.append((fd, HidReportTracker(layouts)))
-            except OSError:
+            except PermissionError as exc:
+                logger.warning(
+                    "Permission denied opening %s for raw HID input monitoring (check udev rules): %s",
+                    path,
+                    exc,
+                )
+                continue
+            except OSError as exc:
+                logger.debug("Could not open %s for raw HID input monitoring: %s", path, exc)
                 continue
 
         if not opened:
@@ -522,12 +534,13 @@ class HidInputMonitor:
 
         try:
             stop_r, stop_w = os.pipe()
-        except OSError:
+        except OSError as exc:
+            logger.warning("Failed to create pipe for HidInputMonitor: %s", exc)
             for fd, _ in opened:
                 try:
                     os.close(fd)
-                except OSError:
-                    pass
+                except OSError as close_exc:
+                    logger.debug("Failed closing hidraw fd after pipe error: %s", close_exc)
             return False
 
         self._stop_w = stop_w
@@ -548,12 +561,12 @@ class HidInputMonitor:
         if stop_w is not None:
             try:
                 os.write(stop_w, b"\x00")
-            except OSError:
-                pass
+            except OSError as exc:
+                logger.debug("Error writing stop signal to HidInputMonitor pipe: %s", exc)
             try:
                 os.close(stop_w)
-            except OSError:
-                pass
+            except OSError as exc:
+                logger.debug("Error closing HidInputMonitor stop pipe write fd: %s", exc)
 
     def _run(self, opened: List[Tuple[int, HidReportTracker]], stop_r: int):
         fd_map = {fd: tracker for fd, tracker in opened}
@@ -580,7 +593,8 @@ class HidInputMonitor:
                         data = os.read(fd, 64)
                     except BlockingIOError:
                         continue
-                    except OSError:
+                    except OSError as exc:
+                        logger.debug("Error reading hidraw fd %d: %s", fd, exc)
                         continue
                     if not data:
                         continue
@@ -602,24 +616,24 @@ class HidInputMonitor:
                         break
                 if emitted:
                     break
-        except OSError:
-            pass
+        except OSError as exc:
+            logger.debug("HidInputMonitor loop exited on OSError: %s", exc)
         finally:
             self._running = False
             for fd in fd_map:
                 try:
                     os.close(fd)
-                except OSError:
-                    pass
+                except OSError as exc:
+                    logger.debug("Error closing hidraw fd %d: %s", fd, exc)
             try:
                 os.close(stop_r)
-            except OSError:
-                pass
+            except OSError as exc:
+                logger.debug("Error closing HidInputMonitor stop read fd: %s", exc)
             with self._pipe_lock:
                 stop_w = self._stop_w
                 self._stop_w = None
             if stop_w is not None:
                 try:
                     os.close(stop_w)
-                except OSError:
-                    pass
+                except OSError as exc:
+                    logger.debug("Error closing HidInputMonitor stop write fd: %s", exc)

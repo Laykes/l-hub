@@ -8,10 +8,13 @@ Only Logitech devices (VID 046d) are ever accessed, and only the hidraw nodes wh
 VID:PID match the requested device. Devices are addressed with index 0xFF (wired/direct).
 """
 import glob
+import logging
 import os
 import select
 import threading
 from typing import Callable, Dict, Optional, Tuple
+
+logger = logging.getLogger(__name__)
 
 LOGITECH_VID = "046d"
 _REPORT_SHORT = 0x10
@@ -61,7 +64,8 @@ def _candidate_paths(vid: str, pid: str):
             with open(f"{node}/device/uevent") as f:
                 if wanted in f.read().upper():
                     yield f"/dev/{os.path.basename(node)}"
-        except OSError:
+        except OSError as exc:
+            logger.debug("Skipping %s while scanning HID++ candidates: %s", node, exc)
             continue
 
 
@@ -74,15 +78,25 @@ def _locate(vid: str, pid: str, feature_id: int) -> Optional[Tuple[str, int]]:
     for path in _candidate_paths(vid, pid):
         try:
             fd = os.open(path, os.O_RDWR)
-        except OSError:
+        except PermissionError as exc:
+            logger.warning(
+                "Permission denied opening %s for HID++ device %s:%s (check udev rules): %s",
+                path,
+                vid,
+                pid,
+                exc,
+            )
+            continue
+        except OSError as exc:
+            logger.debug("Could not open %s for HID++ probing: %s", path, exc)
             continue
         try:
             root = _request_retry(fd, 0x00, 0, bytes([feature_id >> 8, feature_id & 0xFF]))
             if root and root[4] != 0:
                 _cache[key] = (path, root[4])
                 return _cache[key]
-        except OSError:
-            pass  # not the HID++ interface
+        except OSError as exc:
+            logger.debug("HID++ probe failed on %s (feature 0x%04X): %s", path, feature_id, exc)
         finally:
             os.close(fd)
     return None
@@ -96,12 +110,24 @@ def _with_device(vid: str, pid: str, feature_id: int, action):
         path, feature_idx = loc
         try:
             fd = os.open(path, os.O_RDWR)
-        except OSError:
+        except PermissionError as exc:
+            logger.warning(
+                "Permission denied opening %s for HID++ device %s:%s (check udev rules): %s",
+                path,
+                vid,
+                pid,
+                exc,
+            )
+            _cache.pop((vid.lower(), pid.lower(), feature_id), None)
+            return None
+        except OSError as exc:
+            logger.debug("Could not reopen %s for HID++ request: %s", path, exc)
             _cache.pop((vid.lower(), pid.lower(), feature_id), None)
             return None
         try:
             return action(fd, feature_idx)
-        except OSError:
+        except OSError as exc:
+            logger.debug("HID++ request failed on %s: %s", path, exc)
             _cache.pop((vid.lower(), pid.lower(), feature_id), None)
             return None
         finally:
@@ -221,11 +247,22 @@ class OnboardProfileMonitor:
         path, feature_idx = loc
         try:
             fd = os.open(path, os.O_RDONLY)
-        except OSError:
+        except PermissionError as exc:
+            logger.warning(
+                "Permission denied opening %s for HID++ monitor %s:%s (check udev rules): %s",
+                path,
+                self._vid,
+                self._pid,
+                exc,
+            )
+            return False
+        except OSError as exc:
+            logger.debug("Could not open %s for HID++ monitor: %s", path, exc)
             return False
         try:
             stop_r, stop_w = os.pipe()
-        except OSError:
+        except OSError as exc:
+            logger.warning("Failed to create pipe for HID++ monitor: %s", exc)
             os.close(fd)
             return False
 
@@ -248,12 +285,12 @@ class OnboardProfileMonitor:
         if stop_w is not None:
             try:
                 os.write(stop_w, b"\x00")
-            except OSError:
-                pass
+            except OSError as exc:
+                logger.debug("Error writing stop signal to HID++ monitor pipe: %s", exc)
             try:
                 os.close(stop_w)
-            except OSError:
-                pass
+            except OSError as exc:
+                logger.debug("Error closing stop pipe write fd in HID++ monitor: %s", exc)
 
     def _run(self, fd: int, stop_r: int, feature_idx: int):
         try:
@@ -275,18 +312,18 @@ class OnboardProfileMonitor:
                         dpi = get_dpi(self._vid, self._pid)
                         if dpi and 50 <= dpi <= 30000:
                             self._on_dpi_changed(dpi)
-        except OSError:
-            pass
+        except OSError as exc:
+            logger.debug("HID++ monitor stopped due to OSError: %s", exc)
         finally:
             self._running = False
             try:
                 os.close(fd)
-            except OSError:
-                pass
+            except OSError as exc:
+                logger.debug("Error closing HID++ monitor device fd: %s", exc)
             try:
                 os.close(stop_r)
-            except OSError:
-                pass
+            except OSError as exc:
+                logger.debug("Error closing HID++ monitor stop read fd: %s", exc)
             with self._pipe_lock:
                 self._stop_r = None
                 stop_w = self._stop_w
@@ -294,5 +331,5 @@ class OnboardProfileMonitor:
             if stop_w is not None:
                 try:
                     os.close(stop_w)
-                except OSError:
-                    pass
+                except OSError as exc:
+                    logger.debug("Error closing HID++ monitor stop write fd: %s", exc)

@@ -1,7 +1,10 @@
+import logging
 import shutil
 import subprocess
 from typing import List
 from .base import BaseBackend, Device, DeviceType, Capability, BatteryInfo
+
+logger = logging.getLogger(__name__)
 
 
 class UPowerBackend(BaseBackend):
@@ -27,6 +30,7 @@ class UPowerBackend(BaseBackend):
                 timeout=2,
             )
             if res.returncode != 0:
+                logger.warning("upower -e failed (rc=%d): %s", res.returncode, (res.stderr or "").strip())
                 return []
 
             paths = [
@@ -43,6 +47,7 @@ class UPowerBackend(BaseBackend):
                     timeout=2,
                 )
                 if info_res.returncode != 0:
+                    logger.debug("upower -i %s failed (rc=%d): %s", path, info_res.returncode, (info_res.stderr or "").strip())
                     continue
 
                 model = ""
@@ -62,8 +67,8 @@ class UPowerBackend(BaseBackend):
                         val_str = line_s.split(":", 1)[1].strip().replace("%", "")
                         try:
                             percentage = int(float(val_str))
-                        except ValueError:
-                            pass
+                        except ValueError as exc:
+                            logger.debug("Failed to parse UPower percentage %r for %s: %s", val_str, path, exc)
                     elif line_s.startswith("state:"):
                         is_charging = "charging" in line_s.lower() and "discharging" not in line_s.lower()
 
@@ -93,7 +98,7 @@ class UPowerBackend(BaseBackend):
                 )
                 devices.append(dev)
 
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.warning("UPowerBackend scan failed: %s", exc)
 
         return devices
