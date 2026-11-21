@@ -4,11 +4,25 @@ import signal
 from pathlib import Path
 
 from PySide6.QtWidgets import QApplication
+from PySide6.QtGui import QIcon
 from PySide6.QtQml import QQmlApplicationEngine
 from PySide6.QtCore import QUrl
 
 from .manager import DeviceManager
 from .tray import LHubTray
+
+ICON_PATH = Path(__file__).resolve().parent / "assets" / "io.github.lhub.LHub.svg"
+
+
+def load_app_icon() -> QIcon:
+    if ICON_PATH.exists():
+        icon = QIcon(str(ICON_PATH))
+        if not icon.isNull():
+            return icon
+    return QIcon.fromTheme(
+        "io.github.lhub.LHub",
+        QIcon.fromTheme("input-gaming", QIcon.fromTheme("preferences-desktop-peripherals")),
+    )
 
 
 def run():
@@ -18,6 +32,7 @@ def run():
     app.setApplicationName("L-Hub")
     app.setOrganizationName("LHub")
     app.setDesktopFileName("io.github.lhub.LHub")
+    app.setWindowIcon(load_app_icon())
     app.setQuitOnLastWindowClosed(False)
 
     engine = QQmlApplicationEngine()

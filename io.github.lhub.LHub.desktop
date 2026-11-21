@@ -1,9 +1,10 @@
 [Desktop Entry]
 Name=L-Hub
 Comment=Logitech and Peripheral Hub for Linux
-Exec=python3 -m lhub
-Icon=input-gaming
+Exec=l-hub
+Icon=io.github.lhub.LHub
 Terminal=false
 Type=Application
 Categories=Utility;HardwareSettings;Settings;
 StartupNotify=true
+StartupWMClass=io.github.lhub.LHub

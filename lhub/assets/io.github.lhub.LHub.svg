@@ -1,0 +1,43 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" width="128" height="128">
+  <defs>
+    <linearGradient id="bgGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#172a45"/>
+      <stop offset="100%" stop-color="#0b1320"/>
+    </linearGradient>
+    <linearGradient id="borderGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#38bdf8" stop-opacity="0.55"/>
+      <stop offset="50%" stop-color="#1e3a5f" stop-opacity="0.6"/>
+      <stop offset="100%" stop-color="#0ea5e9" stop-opacity="0.3"/>
+    </linearGradient>
+    <radialGradient id="glowGrad" cx="50%" cy="48%" r="48%">
+      <stop offset="0%" stop-color="#0ea5e9" stop-opacity="0.22"/>
+      <stop offset="100%" stop-color="#0ea5e9" stop-opacity="0"/>
+    </radialGradient>
+    <linearGradient id="accentGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#5ce1ff"/>
+      <stop offset="100%" stop-color="#0284c7"/>
+    </linearGradient>
+    <linearGradient id="ringGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#38bdf8" stop-opacity="0.9"/>
+      <stop offset="100%" stop-color="#0369a1" stop-opacity="0.5"/>
+    </linearGradient>
+  </defs>
+
+  <!-- Rounded tile background -->
+  <rect x="8" y="8" width="112" height="112" rx="26" ry="26" fill="url(#bgGrad)" stroke="url(#borderGrad)" stroke-width="2.5"/>
+
+  <!-- Subtle center glow -->
+  <circle cx="64" cy="64" r="46" fill="url(#glowGrad)"/>
+
+  <!-- Hub arc around the emblem (radius 40, centered at 64,64) -->
+  <path d="M 95.5 39.4 A 40 40 0 1 0 95.5 88.6" fill="none" stroke="url(#ringGrad)" stroke-width="6" stroke-linecap="round"/>
+
+  <!-- Bold geometric 'L' mark -->
+  <path d="M 51 44 L 51 80 L 79 80" fill="none" stroke="url(#accentGrad)" stroke-width="11.5" stroke-linecap="round" stroke-linejoin="round"/>
+
+  <!-- Connected peripheral hub nodes along the r=40 orbit -->
+  <circle cx="95.5" cy="39.4" r="5.5" fill="#5ce1ff"/>
+  <circle cx="104" cy="64" r="4.5" fill="#22d3ee"/>
+  <circle cx="95.5" cy="88.6" r="5.5" fill="#38bdf8"/>
+</svg>

@@ -1,6 +1,10 @@
+from pathlib import Path
+
 from PySide6.QtWidgets import QSystemTrayIcon, QMenu, QApplication
 from PySide6.QtGui import QIcon, QAction
 from PySide6.QtCore import QObject
+
+ICON_PATH = Path(__file__).resolve().parent / "assets" / "io.github.lhub.LHub.svg"
 
 
 class LHubTray(QObject):
@@ -10,7 +14,14 @@ class LHubTray(QObject):
         self.window = window
 
         self.tray = QSystemTrayIcon(self)
-        icon = QIcon.fromTheme("input-gaming", QIcon.fromTheme("preferences-desktop-peripherals"))
+        icon = QApplication.windowIcon()
+        if icon.isNull() and ICON_PATH.exists():
+            icon = QIcon(str(ICON_PATH))
+        if icon.isNull():
+            icon = QIcon.fromTheme(
+                "io.github.lhub.LHub",
+                QIcon.fromTheme("input-gaming", QIcon.fromTheme("preferences-desktop-peripherals")),
+            )
         self.tray.setIcon(icon)
         self.tray.setToolTip("L-Hub - Peripheral Control Center")
 
