@@ -16,10 +16,13 @@ from lhub.backends.upower import UPOWER_SERVICE
 from lhub.health import (
     HealthCheckItem,
     RATBAGD_FIX_HINT,
+    RATBAGD_RESTART_HINT,
     SEVERITY_ERROR,
     SEVERITY_INFO,
     SEVERITY_OK,
     SEVERITY_WARNING,
+    _discover_libratbag_mice,
+    _load_libratbag_mouse_matches,
     check_headsetcontrol,
     check_hidraw_permissions,
     check_ratbagd,
@@ -207,6 +210,107 @@ class TestHealthChecks(unittest.TestCase):
         self.assertEqual(item.severity, SEVERITY_OK)
         self.assertFalse(item.is_issue)
         self.assertEqual(item.fix_hint, "")
+
+    def test_ratbagd_warns_when_empty_despite_connected_supported_mouse(self):
+        client = self._make_dbus_client(bus_ok=True, owners={RATBAG_SERVICE})
+        client.get_property.side_effect = lambda svc, path, iface, prop: (
+            2 if prop == "APIVersion" else []
+        )
+        with patch(
+            "lhub.health._discover_libratbag_mice",
+            return_value=[("046d", "c099", "Logitech G502 X")],
+        ):
+            item = check_ratbagd(dbus_client=client)
+
+        self.assertEqual(item.id, "ratbagd")
+        self.assertEqual(item.severity, SEVERITY_WARNING)
+        self.assertTrue(item.is_issue)
+        self.assertIn("Logitech G502 X", item.description)
+        self.assertIn("046d:c099", item.description)
+        self.assertEqual(item.fix_hint, RATBAGD_RESTART_HINT)
+
+    def test_ratbagd_ok_when_empty_and_no_supported_mouse_connected(self):
+        client = self._make_dbus_client(bus_ok=True, owners={RATBAG_SERVICE})
+        client.get_property.side_effect = lambda svc, path, iface, prop: (
+            2 if prop == "APIVersion" else []
+        )
+        with patch("lhub.health._discover_libratbag_mice", return_value=[]):
+            item = check_ratbagd(dbus_client=client)
+
+        self.assertEqual(item.severity, SEVERITY_OK)
+        self.assertFalse(item.is_issue)
+        self.assertEqual(item.fix_hint, "")
+
+    def test_ratbagd_ok_when_devices_present_skips_missed_mouse_scan(self):
+        client = self._make_dbus_client(bus_ok=True, owners={RATBAG_SERVICE})
+        client.get_property.side_effect = lambda svc, path, iface, prop: (
+            2 if prop == "APIVersion" else ["/org/freedesktop/ratbag1/device/hidraw6"]
+        )
+        with patch("lhub.health._discover_libratbag_mice") as m_discover:
+            item = check_ratbagd(dbus_client=client)
+
+        self.assertEqual(item.severity, SEVERITY_OK)
+        self.assertFalse(item.is_issue)
+        m_discover.assert_not_called()
+
+    def test_load_libratbag_mouse_matches_filters_mice_only(self):
+        with tempfile.TemporaryDirectory() as td:
+            (Path(td) / "logitech-g502-x.device").write_text(
+                "[Device]\nName=Logitech G502 X\nDeviceMatch=usb:046d:c099;bluetooth:046d:b099\n"
+                "DeviceType=mouse\nDriver=hidpp20\n",
+                encoding="utf-8",
+            )
+            (Path(td) / "logitech-g-pro-keyboard.device").write_text(
+                "[Device]\nName=Logitech G PRO Keyboard\nDeviceMatch=usb:046d:c339\n"
+                "DeviceType=keyboard\nDriver=hidpp20\n",
+                encoding="utf-8",
+            )
+            matches = _load_libratbag_mouse_matches(data_dirs=(td,))
+
+        self.assertEqual(
+            matches,
+            {
+                ("usb", "046d", "c099"): "Logitech G502 X",
+                ("bluetooth", "046d", "b099"): "Logitech G502 X",
+            },
+        )
+
+    def test_discover_libratbag_mice_deduplicates_and_ignores_receiver_children(self):
+        matches = {
+            ("usb", "046d", "c099"): "Logitech G502 X",
+            ("usb", "046d", "4079"): "Logitech G Pro Wireless",
+        }
+        uevents = {
+            "/sys/class/hidraw/hidraw3/device/uevent": (
+                "DRIVER=hid-generic\nHID_ID=0003:0000046D:00000ABA\n"
+                "HID_NAME=Logitech PRO X Wireless Gaming Headset\n"
+            ),
+            "/sys/class/hidraw/hidraw6/device/uevent": (
+                "DRIVER=hid-generic\nHID_ID=0003:0000046D:0000C099\n"
+                "HID_NAME=Logitech G502 X\n"
+            ),
+            "/sys/class/hidraw/hidraw7/device/uevent": (
+                "DRIVER=hid-generic\nHID_ID=0003:0000046D:0000C099\n"
+                "HID_NAME=Logitech G502 X\n"
+            ),
+            "/sys/class/hidraw/hidraw8/device/uevent": (
+                "DRIVER=logitech-hidpp-device\nHID_ID=0003:0000046D:00004079\n"
+                "HID_NAME=Logitech G Pro\n"
+            ),
+        }
+
+        def fake_open(path, *args, **kwargs):
+            return io.StringIO(uevents[path])
+
+        with patch("lhub.health.glob.glob", return_value=[
+            "/sys/class/hidraw/hidraw3",
+            "/sys/class/hidraw/hidraw6",
+            "/sys/class/hidraw/hidraw7",
+            "/sys/class/hidraw/hidraw8",
+        ]), patch("builtins.open", side_effect=fake_open):
+            mice = _discover_libratbag_mice(known_matches=matches)
+
+        self.assertEqual(mice, [("046d", "c099", "Logitech G502 X")])
 
     def test_headsetcontrol_missing_non_executable_and_ok(self):
         with patch("lhub.health.shutil.which", return_value=None):

@@ -1,6 +1,7 @@
 """System health diagnostics for L-Hub hardware backends and permissions."""
 
 from dataclasses import dataclass
+import functools
 import glob
 import logging
 import os
@@ -26,6 +27,10 @@ ISSUE_SEVERITIES = frozenset({SEVERITY_WARNING, SEVERITY_ERROR})
 
 LOGITECH_VID = "046d"
 RATBAGD_FIX_HINT = "sudo systemctl enable --now ratbagd"
+RATBAGD_RESTART_HINT = "sudo systemctl restart ratbagd"
+LIBRATBAG_DATA_DIRS = ("/usr/share/libratbag", "/usr/local/share/libratbag")
+_HID_BUS_NAMES = {"0003": "usb", "0005": "bluetooth"}
+_WIRELESS_RECEIVER_DRIVERS = frozenset({"logitech-hidpp-device"})
 
 
 @dataclass(frozen=True)
@@ -53,25 +58,135 @@ class HealthCheckItem:
         }
 
 
-def _parse_hidraw_uevent(content: str) -> Tuple[str, str, str]:
-    """Extract (vid, pid, hid_name) from a sysfs hidraw uevent file."""
+def _parse_hidraw_uevent_details(content: str) -> Tuple[str, str, str, str, str]:
+    """Extract (bus, vid, pid, hid_name, driver) from a sysfs hidraw uevent file."""
+    bus = ""
     vid = ""
     pid = ""
     hid_name = ""
+    driver = ""
     for raw_line in content.splitlines():
         line = raw_line.strip()
         if line.startswith("HID_ID="):
             parts = line.split("=", 1)[1].split(":")
             if len(parts) >= 3:
+                bus_raw = parts[0].strip().lower()
                 vid_raw = parts[1].strip().lower()
                 pid_raw = parts[2].strip().lower()
+                if bus_raw:
+                    bus = _HID_BUS_NAMES.get(bus_raw[-4:].zfill(4), "")
                 if vid_raw:
                     vid = vid_raw[-4:].zfill(4)
                 if pid_raw:
                     pid = pid_raw[-4:].zfill(4)
         elif line.startswith("HID_NAME="):
             hid_name = line.split("=", 1)[1].strip()
+        elif line.startswith("DRIVER="):
+            driver = line.split("=", 1)[1].strip()
+    return bus, vid, pid, hid_name, driver
+
+
+def _parse_hidraw_uevent(content: str) -> Tuple[str, str, str]:
+    """Extract (vid, pid, hid_name) from a sysfs hidraw uevent file."""
+    _, vid, pid, hid_name, _ = _parse_hidraw_uevent_details(content)
     return vid, pid, hid_name
+
+
+def _is_hex4(value: str) -> bool:
+    return len(value) == 4 and all(c in "0123456789abcdef" for c in value)
+
+
+def _load_libratbag_mouse_matches(
+    data_dirs: Sequence[str] = LIBRATBAG_DATA_DIRS,
+) -> Dict[Tuple[str, str, str], str]:
+    """Load (bus, vid, pid) -> name entries for mouse definitions in libratbag."""
+    matches: Dict[Tuple[str, str, str], str] = {}
+    for data_dir in data_dirs:
+        if not os.path.isdir(data_dir):
+            continue
+        for dev_file in sorted(glob.glob(os.path.join(data_dir, "*.device"))):
+            try:
+                with open(dev_file, "r", encoding="utf-8", errors="ignore") as f:
+                    lines = f.read().splitlines()
+            except OSError as exc:
+                logger.debug("Could not read libratbag device file %s: %s", dev_file, exc)
+                continue
+
+            in_device_section = False
+            name = ""
+            device_type = ""
+            device_match = ""
+            for raw_line in lines:
+                line = raw_line.strip()
+                if not line or line.startswith("#") or line.startswith(";"):
+                    continue
+                if line.startswith("[") and line.endswith("]"):
+                    in_device_section = line == "[Device]"
+                    continue
+                if not in_device_section or "=" not in line:
+                    continue
+                key, val = line.split("=", 1)
+                key = key.strip()
+                val = val.strip()
+                if key == "Name":
+                    name = val
+                elif key == "DeviceType":
+                    device_type = val
+                elif key == "DeviceMatch":
+                    device_match = val
+
+            if device_type.lower() != "mouse" or not device_match:
+                continue
+
+            for token in device_match.split(";"):
+                parts = token.strip().lower().split(":")
+                if len(parts) < 3:
+                    continue
+                bus = parts[0]
+                if bus not in ("usb", "bluetooth"):
+                    continue
+                vid = parts[1][-4:].zfill(4) if parts[1] else ""
+                pid = parts[2][-4:].zfill(4) if parts[2] else ""
+                if _is_hex4(vid) and _is_hex4(pid):
+                    matches.setdefault((bus, vid, pid), name)
+    return matches
+
+
+@functools.lru_cache(maxsize=1)
+def _get_libratbag_mouse_matches() -> Dict[Tuple[str, str, str], str]:
+    return _load_libratbag_mouse_matches()
+
+
+def _discover_libratbag_mice(
+    known_matches: Optional[Dict[Tuple[str, str, str], str]] = None,
+) -> List[Tuple[str, str, str]]:
+    """Return unique (vid, pid, name) for connected hidraw mice supported by libratbag."""
+    matches = known_matches if known_matches is not None else _get_libratbag_mouse_matches()
+    if not matches:
+        return []
+
+    seen: Set[Tuple[str, str]] = set()
+    mice: List[Tuple[str, str, str]] = []
+    for sys_node in sorted(glob.glob("/sys/class/hidraw/hidraw*")):
+        uevent_path = os.path.join(sys_node, "device", "uevent")
+        try:
+            with open(uevent_path, "r", encoding="utf-8", errors="ignore") as f:
+                bus, vid, pid, hid_name, driver = _parse_hidraw_uevent_details(f.read())
+        except OSError as exc:
+            logger.debug("Could not read %s during ratbagd device check: %s", uevent_path, exc)
+            continue
+
+        if not (bus and vid and pid):
+            continue
+        if driver in _WIRELESS_RECEIVER_DRIVERS:
+            continue
+
+        db_name = matches.get((bus, vid, pid))
+        if db_name is None or (vid, pid) in seen:
+            continue
+        seen.add((vid, pid))
+        mice.append((vid, pid, hid_name or db_name))
+    return mice
 
 
 def _discover_relevant_hidraw_nodes(
@@ -132,6 +247,51 @@ def _build_hidraw_udev_hint(vids: Sequence[str]) -> str:
     return f"printf '%s\\n' {quoted_rules} | {reload_cmd}"
 
 
+def _check_ratbagd_running_devices(client: SystemDBusClient) -> HealthCheckItem:
+    """Verify running ratbagd did not miss a connected libratbag-supported mouse."""
+    try:
+        raw_devices = client.get_property(
+            RATBAG_SERVICE,
+            RATBAG_MANAGER_PATH,
+            RATBAG_MANAGER_IFACE,
+            "Devices",
+        )
+    except DBusError as exc:
+        logger.debug("Could not query ratbagd Devices during health check: %s", exc)
+        raw_devices = None
+
+    if isinstance(raw_devices, (list, tuple)) and len(raw_devices) == 0:
+        missed = _discover_libratbag_mice()
+        if missed:
+            labels = [
+                f"{name} ({vid}:{pid})" if name else f"{vid}:{pid}"
+                for vid, pid, name in missed[:3]
+            ]
+            summary = ", ".join(labels)
+            if len(missed) > 3:
+                summary += f" (+{len(missed) - 3} more)"
+            verb = "is" if len(missed) == 1 else "are"
+            return HealthCheckItem(
+                id="ratbagd",
+                severity=SEVERITY_WARNING,
+                title="ratbagd did not detect connected mouse",
+                description=(
+                    f"ratbagd is running but reports no devices, even though {summary} "
+                    f"{verb} connected. A USB timeout during startup can cause this — "
+                    "restart ratbagd or reconnect the mouse."
+                ),
+                fix_hint=RATBAGD_RESTART_HINT,
+            )
+
+    return HealthCheckItem(
+        id="ratbagd",
+        severity=SEVERITY_OK,
+        title="ratbagd is running",
+        description="libratbag daemon is reachable via D-Bus.",
+        fix_hint="",
+    )
+
+
 def check_ratbagd(dbus_client: Optional[SystemDBusClient] = None) -> HealthCheckItem:
     """Verify ratbagd is reachable over system D-Bus (without CLI subprocesses)."""
     client = dbus_client or get_system_dbus_client()
@@ -152,13 +312,7 @@ def check_ratbagd(dbus_client: Optional[SystemDBusClient] = None) -> HealthCheck
                 RATBAG_MANAGER_IFACE,
                 "APIVersion",
             )
-            return HealthCheckItem(
-                id="ratbagd",
-                severity=SEVERITY_OK,
-                title="ratbagd is running",
-                description="libratbag daemon is reachable via D-Bus.",
-                fix_hint="",
-            )
+            return _check_ratbagd_running_devices(client)
 
         if client.is_service_activatable(RATBAG_SERVICE):
             try:
@@ -169,13 +323,7 @@ def check_ratbagd(dbus_client: Optional[SystemDBusClient] = None) -> HealthCheck
                     RATBAG_MANAGER_IFACE,
                     "APIVersion",
                 )
-                return HealthCheckItem(
-                    id="ratbagd",
-                    severity=SEVERITY_OK,
-                    title="ratbagd is running",
-                    description="libratbag daemon is reachable via D-Bus.",
-                    fix_hint="",
-                )
+                return _check_ratbagd_running_devices(client)
             except DBusTimeoutError:
                 return HealthCheckItem(
                     id="ratbagd",
